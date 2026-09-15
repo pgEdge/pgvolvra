@@ -1,3 +1,10 @@
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/pgedge-labs-dark.svg">
+    <img alt="pgEdge Labs" src="docs/img/pgedge-labs-light.svg" width="320">
+  </picture>
+</div>
+
 # pgVolvra
 
 [![test](https://github.com/pgEdge/pgvolvra/actions/workflows/test.yml/badge.svg)](https://github.com/pgEdge/pgvolvra/actions/workflows/test.yml)
