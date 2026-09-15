@@ -63,10 +63,10 @@ in `LICENSE.md` and `docs/LICENSE.md`, the `repo_url` and copyright in
 `mkdocs.yml`, the CI badge and issue links in `README.md` and the docs,
 and the Go module paths under `github.com/pgedge/`.
 
-The repository currently sits at `github.com/maqeel75/pgvolvra` and is
-intended to move to the pgEdge organisation. Rewriting the references
-to a personal account and back again would churn the history and the
-Go module path for no gain.
+The repository was developed in a personal account and moved to the
+pgEdge organisation on 2026-09-15. Keeping every reference pointing at
+`pgEdge` throughout meant the move changed nothing but the remote: no
+rewritten links, no churned Go module path.
 
 **Amended 2026-09-14.** The repository is named `pgvolvra`, all
 lowercase, and the Go module paths follow it:

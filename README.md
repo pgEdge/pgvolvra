@@ -1,5 +1,7 @@
 # pgVolvra
 
+[![test](https://github.com/pgEdge/pgvolvra/actions/workflows/test.yml/badge.svg)](https://github.com/pgEdge/pgvolvra/actions/workflows/test.yml)
+
 Verified on PostgreSQL 14, 15, 16, 17, 18, and 19 before every release.
 
 Row-level undo and history for PostgreSQL.

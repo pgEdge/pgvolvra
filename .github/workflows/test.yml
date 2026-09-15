@@ -1,14 +1,31 @@
 name: test
 
-# Manual only, deliberately.  The full matrix is 31 jobs -- six PostgreSQL
-# versions across the main battery, examples, concurrency, recovery, and the
-# companion, plus extension packaging -- and each job starts its own
-# containers.  That is a real bill for a repository whose suites are run
-# locally before every commit anyway, so this workflow does not run on push.
+# The full matrix is 31 jobs -- six PostgreSQL versions across the main
+# battery, examples, concurrency, recovery, and the companion, plus multi-node
+# and extension packaging -- and each job starts its own containers.  That is
+# not free, so the triggers are deliberately narrow:
 #
-# To run it: the Actions tab, "test", "Run workflow".  To go back to running
-# on every push, restore the `push:` and `pull_request:` triggers below.
+#   push          only on main, so a feature branch does not run the matrix
+#                 twice once its pull request is open.
+#   pull_request  on every branch, which is where a regression should be
+#                 caught.
+#   paths-ignore  a commit touching only documentation cannot break a SQL
+#                 suite.  GitHub skips only when *every* changed file matches,
+#                 so a mixed commit still runs the full matrix.
+#
+# It can also be started by hand: the Actions tab, "test", "Run workflow".
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'mkdocs.yml'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'mkdocs.yml'
   workflow_dispatch:
 
 jobs:
