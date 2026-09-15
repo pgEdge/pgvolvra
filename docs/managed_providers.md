@@ -269,12 +269,9 @@ for, and it is why `volvra.preflight` should report no critical
 findings on Aurora: the critical findings concern a superuser-owned
 install, which Aurora cannot produce.
 
-If you need a cluster to verify against, `test/aurora-setup.md` in the
-repository builds a throwaway Aurora Serverless v2 cluster with the AWS
-command line, runs this verification, and deletes everything again.
-Those are maintainer notes rather than product documentation, and the
-teardown section is the important part: an Aurora cluster costs money
-for as long as it exists.
+If you build a cluster to verify against, delete it afterwards. An
+Aurora cluster costs money for as long as it exists, and a cluster
+created for a ten-minute verification is easy to forget.
 
 Verify Aurora with the following steps.
 
