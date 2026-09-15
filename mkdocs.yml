@@ -52,8 +52,8 @@ theme:
 extra:
     generator: false
 
-copyright: Copyright &copy; 2026 pgEdge, Inc
-repo_url: https://github.com/pgEdge/pgVolvra
+copyright: Copyright &copy; 2026, pgEdge, Inc
+repo_url: https://github.com/pgEdge/pgvolvra
 
 nav:
   - Overview: index.md
