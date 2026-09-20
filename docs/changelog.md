@@ -4,6 +4,55 @@ All notable changes to pgVolvra are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/), and pgVolvra
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **TRUNCATE on a covered table with a column named `t` recorded a
+  column value instead of the row image, and the data could not be
+  recovered.** Every statement pgVolvra generates aliases the target
+  table, and those aliases were bare names. PostgreSQL resolves such a
+  reference to a column of that name in preference to the row, so
+  `to_jsonb(t)` yielded the column. `volvra.capture_truncate` then stored
+  a scalar where a row image belongs, with a primary key of
+  `{"id": null}`, and the undo failed with "cannot call
+  jsonb_object_keys on a scalar". Nothing reported a problem until the
+  undo was attempted.
+- A covered table with a column named `tgt` could not be undone at all:
+  the generated statement failed with "column reference is ambiguous".
+  That failure was at least loud, and no data was lost.
+- Aliases in generated SQL are now quoted (`"volvra$row"`,
+  `"volvra$tgt"`), which a column name cannot collide with. Columns
+  named `src` or `k` were never affected.
+- **A table using legacy `INHERITS` was covered in name only.** A row
+  trigger is not inherited, so writes reaching child rows were captured
+  by nothing while `volvra.status()` reported the parent as covered and
+  `volvra.health()` reported no problem. Worse, `volvra.enable()`
+  refused to cover the child, reporting it as "already covered through"
+  the parent, so the gap could not be closed deliberately.
+  `volvra._covered_ancestor` now follows partition links only, since
+  coverage propagates to partitions and not to inheritance children.
+  `volvra.enable` warns when a covered parent has uncovered children,
+  and `volvra.preflight` reports the condition as critical.
+- Redefining a table's PRIMARY KEY is now reported as what it is.
+  Statements are built from the table's current key while captured rows
+  hold the old one, so the lookup matched nothing and the conflict guard
+  blamed a later change that never happened.
+
+### Changed
+
+- `volvra.preflight` warns when a covered table has its own BEFORE row
+  triggers. An undo writes the captured row back, so those triggers fire
+  and may rewrite it, and the undo reports success either way.
+
+### Added
+
+- `volvra.as_of(table, timestamp)` reconstructs a covered table as it
+  stood at a past instant, read-only. It writes nothing, refuses on a
+  table that was never covered rather than returning the present and
+  calling it the past, and warns when a table is not currently capturing
+  because changes made in that gap cannot be known.
+
 ## [1.0.0-beta1] - 2026-09-15
 
 ### Added

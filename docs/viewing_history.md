@@ -33,6 +33,34 @@ An UPDATE stores only the columns whose values changed, so `old_row`
 and `new_row` show the difference rather than the whole row. Set
 `capture_updates` to `full` if you need complete images.
 
+## The table as it was
+
+`volvra.as_of` reconstructs a covered table at a past instant. It writes
+nothing, so it is safe to run while you are still deciding whether to
+undo anything:
+
+```sql
+SELECT * FROM volvra.as_of('public.orders', '2026-09-16 15:39');
+```
+
+Each row comes back as a `jsonb` object. Expand them into typed columns
+with `jsonb_populate_record`:
+
+```sql
+SELECT (jsonb_populate_record(NULL::public.orders, r)).*
+FROM volvra.as_of('public.orders', '2026-09-16 15:39') AS r;
+```
+
+Rows deleted since that instant reappear, and rows created since then
+are absent. The instant is inclusive: a change recorded at exactly that
+timestamp counts as having happened.
+
+Two limits are worth knowing. A table that was never covered is refused
+rather than answered, because returning the table as it stands now and
+presenting it as the past would be worse than an error. And a column
+removed from capture with `volvra.exclude_columns` is reported at its
+current value, because no history of it was ever recorded.
+
 ## Recent transactions
 
 `volvra.transactions` groups the history by transaction, newest first,

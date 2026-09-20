@@ -128,6 +128,7 @@ The following table describes each command:
 | unmark | Remove a mark. The history is untouched. |
 | log | List recent transactions, newest first. |
 | history | Show every version of one row. |
+| as-of | Show the table as it was at a past time. |
 | preview | Show the compensating SQL and change nothing. |
 | undo | Show the plan, ask once, then apply. |
 | preview-replay | Show what reapplying the selection would do. |

@@ -55,6 +55,7 @@ MARKERS=(
   'ALL VOLVRA PHASE 1 CHECKS PASSED'
   'ALL VOLVRA REPLAY CHECKS PASSED'
   'ALL VOLVRA REPLAY EDGE CHECKS PASSED'
+  'ALL VOLVRA AS_OF CHECKS PASSED'
   'ALL VOLVRA PHASE 2 CHECKS PASSED'
   'ALL VOLVRA PHASE 3 CHECKS PASSED'
   'ALL VOLVRA PHASE 4 CHECKS PASSED'
@@ -183,6 +184,8 @@ for v in "${VERSIONS[@]}"; do
       q -f /volvra/test/replay.sql
       echo "### replay edge cases ###"
       q -f /volvra/test/replay-edge.sql
+      echo "### as_of (time travel reads) ###"
+      q -f /volvra/test/as-of.sql
       echo "### phase 2 (scope) ###"
       q -f /volvra/test/phase2.sql
       echo "### phase 3 (scale) ###"

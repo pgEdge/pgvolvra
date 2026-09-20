@@ -297,6 +297,27 @@ func cmdHistory(ctx context.Context, db *DB, args []string) (int, error) {
 	return exitOK, nil
 }
 
+// as_of returns one jsonb object per row.  Expanding those into typed columns
+// needs the table's rowtype, which cannot be a bind parameter, and pasting a
+// user-supplied name into SQL is exactly what this CLI exists to avoid.  The
+// rows are printed as JSON instead; jsonb_populate_record is the documented
+// way to get typed columns from SQL.
+func cmdAsOf(ctx context.Context, db *DB, args []string) (int, error) {
+	if len(args) != 2 {
+		return exitError, fmt.Errorf(
+			"as-of needs a table and a time, e.g. as-of orders '2026-09-16 15:39'\n" +
+				`a trailing "ago" works too: as-of orders '2 hours ago'`)
+	}
+	t, err := db.Query(ctx,
+		`SELECT r AS row FROM volvra.as_of($1::regclass, `+when("$2")+`) AS r`,
+		args[0], args[1])
+	if err != nil {
+		return exitError, err
+	}
+	t.Write(os.Stdout)
+	return exitOK, nil
+}
+
 func cmdForget(ctx context.Context, db *DB, args []string, yes bool) (int, error) {
 	if len(args) < 2 {
 		return exitError, fmt.Errorf("forget needs a table and a pk as JSON")

@@ -623,5 +623,191 @@ BEGIN
          format('and the row that did not move is not flagged, got %s total', v_conf);
 END $$;
 
+-- ---------------------------------------------------------------------
+-- P1.12  Column names that collide with the aliases in generated SQL.
+--
+-- Every statement volvra builds aliases the user's table.  With a bare
+-- alias, a column of the same name wins the reference, and the damage is
+-- silent: to_jsonb(t) yields that column instead of the row, so TRUNCATE
+-- capture stored a scalar where a row image belongs and the data became
+-- unrecoverable.  A column named tgt broke undo outright.
+--
+-- Shipped in 1.0.0-beta1 and found on 2026-09-20 while testing as_of.
+-- The aliases are quoted now; this asserts they stay that way.
+-- ---------------------------------------------------------------------
+\echo '--- P1.12 alias collisions ---'
+
+DROP TABLE IF EXISTS collide;
+CREATE TABLE collide (
+  id  int PRIMARY KEY,
+  t   timestamptz,     -- the alias capture_truncate and as_of use
+  tgt text,            -- the alias the undo statements use
+  src text,            -- the alias the update statement uses
+  k   text,            -- the alias the key lookup uses
+  v   text
+);
+INSERT INTO collide VALUES
+  (1, now(), 'a', 'b', 'c', 'before'),
+  (2, now(), 'd', 'e', 'f', 'before2');
+SELECT volvra.enable('collide');
+
+DO $$
+DECLARE v_pk jsonb; v_img jsonb; v_n bigint; v_v text;
+BEGIN
+  -- An UPDATE must still be undoable when every alias name is taken.
+  UPDATE collide SET v = 'after' WHERE id = 1;
+  PERFORM volvra.undo(target => 'collide',
+                      from_ts => now() - interval '1 minute', confirm => true);
+  SELECT v INTO v_v FROM collide WHERE id = 1;
+  ASSERT v_v = 'before',
+    format('P1.12: undo left %s; an aliased column broke the guard', v_v);
+
+  -- TRUNCATE must record real row images, not a column value.
+  TRUNCATE collide;
+  SELECT count(*) INTO v_n
+  FROM volvra.change_log WHERE table_name = 'public.collide' AND op = 'D';
+  ASSERT v_n = 2,
+    format('P1.12: truncate recorded %s rows, expected 2', v_n);
+
+  SELECT pk, old_row INTO v_pk, v_img
+  FROM volvra.change_log
+  WHERE table_name = 'public.collide' AND op = 'D' ORDER BY id LIMIT 1;
+  ASSERT jsonb_typeof(v_img) = 'object',
+    format('P1.12: truncate stored a %s, not a row image', jsonb_typeof(v_img));
+  ASSERT v_pk -> 'id' IS NOT NULL AND v_pk ->> 'id' IS NOT NULL,
+    format('P1.12: truncate recorded pk %s; the alias resolved to a column', v_pk);
+
+  -- And the truncate must actually be reversible, which is the whole point.
+  PERFORM volvra.undo(target => 'collide',
+                      from_ts => now() - interval '1 minute', confirm => true);
+  SELECT count(*) INTO v_n FROM collide;
+  ASSERT v_n = 2,
+    format('P1.12: %s rows came back after undoing the truncate, expected 2', v_n);
+END $$;
+
+-- ---------------------------------------------------------------------
+-- P1.13  Redefining the primary key is reported as what it is.
+--
+-- The statement is built from the table's CURRENT key while the captured
+-- pk holds the old one, so the lookup finds nothing and the guard used to
+-- report a conflict -- sending the reader after a concurrent change that
+-- never happened.
+-- ---------------------------------------------------------------------
+\echo '--- P1.13 primary key redefined ---'
+DROP TABLE IF EXISTS pkchange;
+CREATE TABLE pkchange (a int, b int, v text, PRIMARY KEY (a));
+INSERT INTO pkchange VALUES (1, 1, 'before');
+SELECT volvra.enable('pkchange');
+
+DO $$
+DECLARE v_msg text; v_ok boolean := false;
+BEGIN
+  PERFORM pg_sleep(0.05);
+  UPDATE pkchange SET v = 'after';
+  ALTER TABLE pkchange DROP CONSTRAINT pkchange_pkey;
+  ALTER TABLE pkchange ADD PRIMARY KEY (a, b);
+  BEGIN
+    PERFORM volvra.undo(target => 'pkchange',
+                        from_ts => now() - interval '1 minute', confirm => true);
+  EXCEPTION WHEN OTHERS THEN
+    v_msg := SQLERRM; v_ok := true;
+  END;
+  ASSERT v_ok, 'P1.13: undo must refuse when the primary key was redefined';
+  ASSERT v_msg ILIKE '%primary key%has changed%',
+    format('P1.13: the message blamed something else: %s', v_msg);
+END $$;
+
+-- ---------------------------------------------------------------------
+-- P1.14  Legacy INHERITS is not partitioning.
+--
+-- A row trigger is not inherited, so UPDATE on the parent rewrites child
+-- rows that nothing captures.  Worse, volvra.enable() used to refuse the
+-- child as "already covered through" the parent, so the gap could not be
+-- closed even deliberately.  Partition links must keep working.
+-- ---------------------------------------------------------------------
+\echo '--- P1.14 inheritance children ---'
+DROP TABLE IF EXISTS inh_child;
+DROP TABLE IF EXISTS inh_parent CASCADE;
+CREATE TABLE inh_parent (id int PRIMARY KEY, v text);
+CREATE TABLE inh_child () INHERITS (inh_parent);
+ALTER TABLE inh_child ADD PRIMARY KEY (id);
+INSERT INTO inh_parent VALUES (1, 'before');
+INSERT INTO inh_child  VALUES (2, 'before');
+
+DO $$
+DECLARE v_n bigint; v_p text; v_c text;
+BEGIN
+  PERFORM volvra.enable('inh_parent');
+
+  -- The gap is reported rather than hidden.
+  SELECT count(*) INTO v_n FROM volvra.preflight()
+  WHERE finding ILIKE '%inheritance%';
+  ASSERT v_n = 1,
+    'P1.14: a covered parent with an uncovered child must be a preflight finding';
+
+  -- And it can actually be closed.
+  PERFORM volvra.enable('inh_child');
+  SELECT count(*) INTO v_n FROM volvra.preflight()
+  WHERE finding ILIKE '%inheritance%';
+  ASSERT v_n = 0,
+    'P1.14: covering the child must clear the finding; enable() refused it '
+    'as "already covered" before';
+
+  PERFORM pg_sleep(0.05);
+  UPDATE inh_parent SET v = 'after';          -- rewrites both rows
+  PERFORM volvra.undo(target => 'inh_parent',
+                      from_ts => now() - interval '1 minute', confirm => true);
+  PERFORM volvra.undo(target => 'inh_child',
+                      from_ts => now() - interval '1 minute', confirm => true);
+  SELECT v INTO v_p FROM ONLY inh_parent WHERE id = 1;
+  SELECT v INTO v_c FROM inh_child WHERE id = 2;
+  ASSERT v_p = 'before', format('P1.14: parent row is %s', v_p);
+  ASSERT v_c = 'before',
+    format('P1.14: child row is %s; the child had no history of its own', v_c);
+END $$;
+
+-- ---------------------------------------------------------------------
+-- P1.15  A table's own BEFORE row trigger can rewrite what an undo puts
+--        back, and the undo still reports success.  That is PostgreSQL
+--        semantics rather than a fault, but the product promises to
+--        restore the captured row, so preflight says when it cannot.
+--        A trigger that suppresses the write is a different case: the
+--        guard catches that one and refuses.
+-- ---------------------------------------------------------------------
+\echo '--- P1.15 user BEFORE triggers ---'
+DROP TABLE IF EXISTS stamped;
+CREATE TABLE stamped (id int PRIMARY KEY, v text, touched timestamptz);
+CREATE OR REPLACE FUNCTION stamp_touched() RETURNS trigger
+LANGUAGE plpgsql AS $t$
+BEGIN NEW.touched := '2099-01-01'::timestamptz; RETURN NEW; END $t$;
+CREATE TRIGGER stamped_before BEFORE UPDATE ON stamped
+  FOR EACH ROW EXECUTE FUNCTION stamp_touched();
+INSERT INTO stamped VALUES (1, 'before', '2000-01-01');
+SELECT volvra.enable('stamped');
+
+DO $$
+DECLARE v_n bigint; v_v text; v_touched timestamptz;
+BEGIN
+  SELECT count(*) INTO v_n FROM volvra.preflight()
+  WHERE finding ILIKE '%BEFORE row trigger%';
+  ASSERT v_n = 1,
+    'P1.15: a covered table with its own BEFORE row trigger must be reported';
+
+  PERFORM pg_sleep(0.05);
+  UPDATE stamped SET v = 'after';
+  PERFORM volvra.undo(target => 'stamped',
+                      from_ts => now() - interval '1 minute', confirm => true);
+
+  SELECT v, touched INTO v_v, v_touched FROM stamped WHERE id = 1;
+  ASSERT v_v = 'before', format('P1.15: v is %s', v_v);
+  -- The column the trigger owns is NOT restored, which is exactly why the
+  -- warning exists.  Asserted so the behaviour cannot drift unnoticed.
+  ASSERT v_touched = '2099-01-01'::timestamptz,
+    format('P1.15: touched is %s; if this now restores, the preflight '
+           'warning is stale and should be revisited', v_touched);
+END $$;
+
+DROP TRIGGER stamped_before ON stamped;
+
 \echo ''
 \echo '*** ALL VOLVRA PHASE 1 CHECKS PASSED ***'

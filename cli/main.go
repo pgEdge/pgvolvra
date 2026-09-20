@@ -35,6 +35,7 @@ const usage = `volvra -- undo for Postgres
 
   volvra log [-n N] [--since WHEN]    recent transactions, newest first
   volvra history TABLE PK_JSON        every version of one row
+  volvra as-of TABLE WHEN             the table as it was, read-only
 
   volvra preview SELECTOR...          show the compensating SQL, change nothing
   volvra undo SELECTOR...             show it, ask once, then apply
@@ -189,6 +190,8 @@ haveCmd:
 		code, err = cmdLog(ctx, db, kept)
 	case "history":
 		code, err = cmdHistory(ctx, db, kept)
+	case "as-of":
+		code, err = cmdAsOf(ctx, db, kept)
 	case "preview":
 		code, err = cmdPreview(ctx, db, kept)
 	case "undo":

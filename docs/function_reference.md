@@ -266,6 +266,39 @@ The function takes `target regclass` and `pk jsonb`, matching the key
 by containment, and returns `change_id`, `ts`, `actor`, `db_user`,
 `op`, `txid`, `old_row`, and `new_row`.
 
+### volvra.as_of
+
+Returns a covered table as it stood at a past instant, without changing
+anything. Requires membership in `volvra_viewer` and SELECT privilege
+on the table.
+
+The function takes `target regclass` and `at_ts timestamptz`, and
+returns one `jsonb` object per row. Expand a result with
+`jsonb_populate_record` when typed columns are wanted:
+
+```sql
+SELECT (jsonb_populate_record(NULL::public.orders, r)).*
+FROM volvra.as_of('public.orders', '2026-09-16 15:39') AS r;
+```
+
+A row is reconstructed from the current row overlaid with the recorded
+values of every change made since `at_ts`. Rows deleted since then
+reappear, and rows created since then are absent. The instant is
+inclusive: a change recorded at exactly `at_ts` is treated as having
+happened.
+
+The function refuses on a table that was never covered, because
+returning the table as it stands now and presenting it as the past
+would be worse than an error. It warns when a table is registered but
+not currently capturing, because changes made while capture was off
+cannot be reconstructed.
+
+Columns removed from capture with `volvra.exclude_columns` are
+reported at their current values, because their history was never
+recorded and cannot be reconstructed. Generated columns are
+reconstructed correctly: a stored generated column changes whenever its
+source column does, so it is captured along with it.
+
 ### volvra.transactions
 
 Groups recent history by transaction, newest first. Requires

@@ -26,6 +26,8 @@ pgVolvra includes the following features:
   across every table the transaction touched.
 - viewing every version of a row over time, with the actor and
   timestamp for each change.
+- reading a whole table as it stood at a past instant, without
+  changing anything.
 - refusing to overwrite a change made after the mistake, rather than
   silently destroying it.
 - capping the number of rows a single undo may affect.

@@ -95,6 +95,7 @@ INSERT INTO pm_fn (fn, call_sql, tier) VALUES
   ('history',              $$SELECT count(*) FROM volvra.history('pm.t','{"id":1}')$$,  'viewer_table'),
   ('preview_undo',         $$SELECT count(*) FROM volvra.preview_undo('pm.t','2000-01-01','2000-01-02')$$, 'viewer_table'),
   ('preview_replay',       $$SELECT count(*) FROM volvra.preview_replay('pm.t','2000-01-01','2000-01-02')$$, 'viewer_table'),
+  ('as_of',                $$SELECT count(*) FROM volvra.as_of('pm.t', now())$$,       'viewer_table'),
   -- A txid names no table, so the plan is unscoped and read privilege is
   -- required on EVERY covered table.  No role in this matrix has that, and
   -- that refusal is the correct answer rather than a gap.

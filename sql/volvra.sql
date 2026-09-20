@@ -880,12 +880,21 @@ RETURNS TABLE (table_name text, excluded_columns text[], update_mode text)
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
+  -- Partition links only.  pg_inherits also records legacy INHERITS, where
+  -- coverage does NOT propagate: a row trigger on the parent never fires for
+  -- a child's rows.  Treating those alike made enable() refuse to cover an
+  -- inheritance child, telling the user it was "already covered through" the
+  -- parent while nothing captured its writes at all.
   WITH RECURSIVE up AS (
     SELECT i.inhparent AS relid, 1 AS lvl
-    FROM pg_inherits i WHERE i.inhrelid = p_relid
+    FROM pg_inherits i
+    JOIN pg_class pc ON pc.oid = i.inhparent AND pc.relkind = 'p'
+    WHERE i.inhrelid = p_relid
     UNION ALL
     SELECT i.inhparent, u.lvl + 1
-    FROM up u JOIN pg_inherits i ON i.inhrelid = u.relid
+    FROM up u
+    JOIN pg_inherits i ON i.inhrelid = u.relid
+    JOIN pg_class pc   ON pc.oid = i.inhparent AND pc.relkind = 'p'
     WHERE u.lvl < 32
   )
   SELECT e.table_name, e.excluded_columns, e.update_mode
@@ -1107,9 +1116,15 @@ BEGIN
     EXECUTE format(
       'INSERT INTO volvra.change_log '
       '  (table_name, op, pk, old_row, new_row, actor, db_user, txid) '
-      'SELECT %L, ''D'', volvra._extract_pk(to_jsonb(t), %L::text[]), to_jsonb(t), '
+      -- The alias is quoted and deliberately unusable as a column name.
+      -- With a bare alias, a covered table owning a column of the same name
+      -- wins the reference: to_jsonb(t) then yields that column instead of
+      -- the row, and TRUNCATE records a scalar where a row image belongs.
+      -- The data is unrecoverable at that point, and nothing says so.
+      'SELECT %L, ''D'', volvra._extract_pk(to_jsonb("volvra$row"), %L::text[]), '
+      '       to_jsonb("volvra$row"), '
       '       NULL, volvra._actor(), volvra._db_user(), txid_current() '
-      'FROM %s AS t', v_tbl, v_pk, v_src);
+      'FROM %s AS "volvra$row"', v_tbl, v_pk, v_src);
 
     RETURN NULL;
   END IF;
@@ -1415,6 +1430,33 @@ BEGIN
     PERFORM count(*) FROM volvra.cover_partitions(target);
   END IF;
 
+  -- Legacy inheritance is the quiet version of the partition problem above.
+  -- A row trigger is not inherited, so UPDATE on the parent rewrites child
+  -- rows that nothing captures, while status() still reports the table as
+  -- covered.  Partitions are excluded here: cover_partitions() handles those.
+  DECLARE v_kids text;
+  BEGIN
+    SELECT string_agg(format('%I.%I', n.nspname, c.relname), ', '
+                      ORDER BY n.nspname, c.relname)
+      INTO v_kids
+    FROM pg_inherits i
+    JOIN pg_class c     ON c.oid = i.inhrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_class pc    ON pc.oid = i.inhparent
+    WHERE i.inhparent = target
+      AND pc.relkind = 'r'                      -- not a partitioned table
+      AND NOT EXISTS (SELECT 1 FROM volvra.enabled_tables e
+                      WHERE e.rel_oid = c.oid);
+
+    IF v_kids IS NOT NULL THEN
+      RAISE WARNING 'volvra: % has inheritance children that are not covered: %',
+        v_tbl, v_kids
+        USING HINT = 'A row trigger is not inherited, so writes that reach '
+                     'those rows are not captured and cannot be undone. '
+                     'Call volvra.enable() on each child as well.';
+    END IF;
+  END;
+
   RETURN format('volvra: capture enabled on %s (pk: %s)',
                 v_tbl, array_to_string(v_pkcols, ', '));
 END
@@ -1656,6 +1698,133 @@ END
 $$;
 
 -- ---------------------------------------------------------------------
+-- Time travel: the table as it was, read-only.
+--
+-- undo() reverses history by writing.  as_of() answers the question people
+-- actually ask first -- "what did this look like before?" -- without touching
+-- a single row.  It is the half of Oracle Flashback that volvra did not have.
+--
+-- The reconstruction is not a lookup, because an UPDATE stores only the
+-- columns that changed.  A row at time T is therefore the row as it stands
+-- now, overlaid with the old values of every change since T, applied newest
+-- first so that the oldest overlay -- the one closest to T -- wins.
+--
+-- Three cases fall out of that one rule:
+--   * untouched since T  -- no changes in the window, so the current row is
+--                           already the answer.
+--   * deleted since T    -- absent now, but the DELETE carries a complete old
+--                           image, which the overlay restores.
+--   * inserted since T   -- the oldest change in the window is an INSERT, so
+--                           the row did not exist at T and is dropped.
+-- ---------------------------------------------------------------------
+-- No custom aggregate here, deliberately.  volvra.fingerprint() hashes every
+-- function in the schema with pg_get_functiondef(), which raises on an
+-- aggregate, so adding one silently breaks tamper evidence.  The fold is
+-- expressed below as a per-column pick instead, which is clearer anyway.
+DROP AGGREGATE IF EXISTS volvra._rewind(jsonb);
+DROP FUNCTION IF EXISTS volvra._overlay(jsonb, jsonb);
+
+CREATE OR REPLACE FUNCTION volvra.as_of(target regclass, at_ts timestamptz)
+RETURNS SETOF jsonb
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_tbl  text := volvra._fqname(target);
+  v_pk   text[];
+  v_cov  boolean;
+  v_anc  text;
+BEGIN
+  PERFORM volvra._require('volvra_viewer');
+  PERFORM volvra._require_read(target);
+
+  -- disable() keeps the history and drops the registration, so the ledger is
+  -- not the only place to look for a key.  history() still answers for such a
+  -- table and as_of() must too.
+  SELECT e.pk_columns INTO v_pk
+  FROM volvra.enabled_tables e WHERE e.table_name = v_tbl;
+  IF v_pk IS NULL THEN
+    v_pk := volvra._pkcols(target);
+  END IF;
+
+  IF coalesce(cardinality(v_pk), 0) = 0 THEN
+    RAISE EXCEPTION 'volvra.as_of(%): table has no PRIMARY KEY', v_tbl
+      USING HINT = 'Rows are identified by primary key, as they are for undo.',
+            ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  -- Answering from no history at all would return the table as it stands now
+  -- and call it the past, which is the one answer worse than refusing.
+  IF NOT EXISTS (SELECT 1 FROM volvra.enabled_tables e WHERE e.table_name = v_tbl)
+     AND NOT EXISTS (SELECT 1 FROM volvra.change_log c WHERE c.table_name = v_tbl)
+  THEN
+    -- A partition's history is recorded under the covered ancestor, so it has
+    -- none of its own.  Telling the caller to enable() it would be a dead end:
+    -- enable() refuses a partition as already covered through its parent.
+    SELECT a.table_name INTO v_anc FROM volvra._covered_ancestor(target) AS a;
+    IF v_anc IS NOT NULL THEN
+      RAISE EXCEPTION 'volvra.as_of(%): history is recorded under %', v_tbl, v_anc
+        USING HINT = format('This table is covered through %s, which volvra '
+                            'treats as one table. Call volvra.as_of(%L, ...) '
+                            'instead.', v_anc, v_anc),
+              ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    RAISE EXCEPTION 'volvra.as_of(%): no history for this table', v_tbl
+      USING HINT = 'Cover it with volvra.enable() first. Nothing before that '
+                   'moment was recorded.',
+            ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  -- Registered but not capturing, or no longer registered: changes made in the
+  -- gap are missing, and a silently incomplete answer is worse than a noisy one.
+  SELECT s.covered INTO v_cov FROM volvra.status() s WHERE s.table_name = v_tbl;
+  IF NOT coalesce(v_cov, false) THEN
+    RAISE WARNING 'volvra.as_of(%): the table is not capturing, so any change '
+                  'made while it was uncovered is missing from this answer', v_tbl;
+  END IF;
+
+  RETURN QUERY EXECUTE format($q$
+    WITH cur AS (
+      -- Quoted alias, for the reason given in volvra.capture_truncate().
+      SELECT volvra._extract_pk(to_jsonb("volvra$row"), %2$L::text[]) AS pk,
+             to_jsonb("volvra$row") AS img
+      FROM %1$s AS "volvra$row"
+    ),
+    win AS (
+      SELECT c.pk, c.id, c.op, c.old_row
+      FROM volvra.change_log c
+      WHERE c.table_name = %3$L AND c.ts > %4$L::timestamptz
+    ),
+    -- For each column, the value at T is the one carried by the OLDEST
+    -- change after T, because that change recorded what the column held
+    -- immediately before it.  DISTINCT ON picks exactly that.
+    kv AS (
+      SELECT DISTINCT ON (w.pk, e.key) w.pk, e.key, e.value
+      FROM win w
+      CROSS JOIN LATERAL jsonb_each(coalesce(w.old_row, '{}'::jsonb)) AS e
+      ORDER BY w.pk, e.key, w.id
+    ),
+    overlay AS (
+      SELECT kv.pk, jsonb_object_agg(kv.key, kv.value) AS obj
+      FROM kv GROUP BY kv.pk
+    ),
+    -- The oldest change decides whether the row existed at all: an INSERT
+    -- there means it did not.
+    oldest AS (
+      SELECT DISTINCT ON (w.pk) w.pk, w.op FROM win w ORDER BY w.pk, w.id
+    )
+    SELECT coalesce(c.img, '{}'::jsonb) || coalesce(o.obj, '{}'::jsonb)
+    FROM cur c
+    FULL JOIN overlay o ON o.pk = c.pk
+    LEFT JOIN oldest od ON od.pk = coalesce(c.pk, o.pk)
+    WHERE od.op IS DISTINCT FROM 'I'
+  $q$, v_tbl, v_pk, v_tbl, at_ts);
+END
+$$;
+
+
+-- ---------------------------------------------------------------------
 -- Schema drift
 --
 -- A row image captured before an ALTER TABLE may no longer fit the table it
@@ -1765,16 +1934,16 @@ LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
   SELECT format(
-    'DELETE FROM %s AS tgt USING jsonb_populate_record(NULL::%s, %L::jsonb) AS k WHERE %s%s',
+    'DELETE FROM %s AS "volvra$tgt" USING jsonb_populate_record(NULL::%s, %L::jsonb) AS k WHERE %s%s',
     v_tbl, v_tbl, pk_img,
-    (SELECT string_agg(format('tgt.%1$I = k.%1$I', c), ' AND ')
+    (SELECT string_agg(format('"volvra$tgt".%1$I = k.%1$I', c), ' AND ')
      FROM unnest(v_pkcols) AS c),
     -- Containment, not equality: the guard asserts that the values this
     -- statement is about to revert are still the ones that were captured.  A
     -- change to some *other* column is not a conflict, because reverting these
     -- columns cannot destroy it.
     CASE WHEN expected IS NULL THEN ''
-         ELSE format(' AND to_jsonb(tgt) @> %L::jsonb', expected) END)
+         ELSE format(' AND to_jsonb("volvra$tgt") @> %L::jsonb', expected) END)
 $$;
 
 -- Locate the row by its *current* (post-change) pk and restore the columns the
@@ -1793,16 +1962,16 @@ LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
   SELECT format(
-    'UPDATE %s AS tgt SET %s FROM jsonb_populate_record(NULL::%s, %L::jsonb) AS src, '
+    'UPDATE %s AS "volvra$tgt" SET %s FROM jsonb_populate_record(NULL::%s, %L::jsonb) AS src, '
     'jsonb_populate_record(NULL::%s, %L::jsonb) AS k WHERE %s%s',
     v_tbl,
     (SELECT string_agg(format('%1$I = src.%1$I', c), ', ') FROM unnest(v_cols) AS c),
     v_tbl, old_img,
     v_tbl, key_img,
-    (SELECT string_agg(format('tgt.%1$I = k.%1$I', c), ' AND ')
+    (SELECT string_agg(format('"volvra$tgt".%1$I = k.%1$I', c), ' AND ')
      FROM unnest(v_pkcols) AS c),
     CASE WHEN expected IS NULL THEN ''
-         ELSE format(' AND to_jsonb(tgt) @> %L::jsonb', expected) END)
+         ELSE format(' AND to_jsonb("volvra$tgt") @> %L::jsonb', expected) END)
 $$;
 
 -- Read the live row image for a pk, or NULL if the row is gone.
@@ -1813,10 +1982,11 @@ LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
   SELECT format(
-    'SELECT to_jsonb(tgt) FROM %s AS tgt, jsonb_populate_record(NULL::%s, %L::jsonb) AS k '
+    'SELECT to_jsonb("volvra$tgt") FROM %s AS "volvra$tgt", '
+    'jsonb_populate_record(NULL::%s, %L::jsonb) AS k '
     'WHERE %s',
     v_tbl, v_tbl, pk_img,
-    (SELECT string_agg(format('tgt.%1$I = k.%1$I', c), ' AND ')
+    (SELECT string_agg(format('"volvra$tgt".%1$I = k.%1$I', c), ' AND ')
      FROM unnest(v_pkcols) AS c))
 $$;
 
@@ -2044,6 +2214,24 @@ BEGIN
     v_step.ts         := r.ts;
     v_step.status     := 'planned';
     v_step.conflict   := NULL;
+
+    -- The statement is built from the table's CURRENT key, while the
+    -- captured pk holds the key as it was.  Redefining the primary key
+    -- therefore leaves the lookup with a NULL for the new column, no row
+    -- matches, and the guard reports a conflict -- blaming a later change
+    -- that never happened.  Say what actually changed instead.
+    IF NOT (r.pk ?& v_pkcols) THEN
+      RAISE EXCEPTION
+        'volvra: the primary key of % has changed since this row was captured',
+        r.table_name
+        USING DETAIL = format(
+                'captured key: %s; the key is now (%s)',
+                r.pk::text, array_to_string(v_pkcols, ', ')),
+              HINT = 'Rows captured under the old key cannot be located by the '
+                     'new one. Restore them by hand, or narrow the window to '
+                     'changes captured under the current key.',
+              ERRCODE = 'invalid_parameter_value';
+    END IF;
 
     -- Validate the image this step will apply, which differs by direction:
     -- an undo writes the "before" image back, a replay writes the "after"
@@ -4198,6 +4386,48 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
       v_repl := false;
     END;
+  END IF;
+
+  -- volvra restores a row by writing it back, so the table's own BEFORE row
+  -- triggers fire on the way in and may rewrite what they are handed.  An
+  -- updated_at stamp is harmless; a trigger that normalises or overwrites
+  -- business data means the restored row is not the captured one, and the
+  -- undo still reports success.  A trigger that suppresses the write is
+  -- caught by the guard, so only the rewriting kind needs saying out loud.
+  SELECT count(DISTINCT e.table_name) INTO v_n
+  FROM volvra.enabled_tables e
+  JOIN pg_trigger tg ON tg.tgrelid = e.rel_oid
+  WHERE NOT tg.tgisinternal
+    AND tg.tgname NOT LIKE 'volvra\_%'
+    AND (tg.tgtype & 1) = 1          -- FOR EACH ROW
+    AND (tg.tgtype & 2) = 2;         -- BEFORE
+  IF v_n > 0 THEN
+    severity := 'warning';
+    finding  := format('%s covered table(s) have their own BEFORE row triggers', v_n);
+    detail   := 'An undo writes the captured row back, so those triggers fire '
+                'and may rewrite it. The undo reports success either way, and '
+                'the restored row can differ from what was captured.';
+    RETURN NEXT;
+  END IF;
+
+  -- A covered parent with uncovered inheritance children reports as healthy
+  -- while half its rows have no history: the trigger is not inherited, so
+  -- writes reaching child rows are captured by nothing.  Partitions are
+  -- excluded; cover_partitions() handles those.
+  SELECT count(*) INTO v_n
+  FROM volvra.enabled_tables e
+  JOIN pg_inherits i  ON i.inhparent = e.rel_oid
+  JOIN pg_class pc    ON pc.oid = i.inhparent AND pc.relkind = 'r'
+  WHERE NOT EXISTS (SELECT 1 FROM volvra.enabled_tables c
+                    WHERE c.rel_oid = i.inhrelid);
+  IF v_n > 0 THEN
+    severity := 'critical';
+    finding  := format('%s covered table(s) have uncovered inheritance children', v_n);
+    detail   := 'A row trigger is not inherited, so writes that reach those '
+                'child rows are never captured and cannot be undone, while '
+                'volvra.status() still reports the parent as covered. Call '
+                'volvra.enable() on each child.';
+    RETURN NEXT;
   END IF;
 
   IF v_repl THEN

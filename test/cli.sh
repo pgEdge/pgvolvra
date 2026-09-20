@@ -84,6 +84,46 @@ BAD_TXID=$(psql -tA -c "SELECT txid FROM volvra.transactions() ORDER BY ended DE
 "$V" log -n 3 >/dev/null 2>&1 && ok "log" || bad "log"
 says "log shows the bad transaction" "$BAD_TXID" "$V" log -n 3
 
+printf '=== C3b. as-of ===\n'
+# Self-contained: a time before the table existed would correctly return
+# nothing, so the mark has to sit between the insert and the change.
+psql -q -v ON_ERROR_STOP=1 <<'SQL'
+DROP TABLE IF EXISTS cli_asof;
+CREATE TABLE cli_asof (id int PRIMARY KEY, v text);
+INSERT INTO cli_asof VALUES (1,'ORIGINAL');
+SELECT volvra.enable('cli_asof');
+SQL
+sleep 1
+ASOF_MARK=$(psql -tA -c "SELECT clock_timestamp()")
+sleep 1
+psql -q -c "UPDATE cli_asof SET v='CHANGED'" >/dev/null
+
+ASOF=$("$V" as-of cli_asof "$ASOF_MARK" 2>&1)
+case "$ASOF" in
+  *ORIGINAL*) ok "as-of shows the value from before the change" ;;
+  *)          bad "as-of shows the value from before the change"
+              printf '%s\n' "$ASOF" | sed 's/^/       | /' ;;
+esac
+case "$ASOF" in
+  *CHANGED*) bad "as-of must not show the current value" ;;
+  *)         ok "as-of does not show the current value" ;;
+esac
+
+# "ago" is resolved on the server; it was broken in the bash CLI.  Which
+# value comes back depends on where the second boundary falls, so this
+# asserts only that the form is accepted and answers.
+AGO=$("$V" as-of cli_asof '30 seconds ago' 2>&1)
+if [ $? -eq 0 ] && printf '%s' "$AGO" | grep -qE 'ORIGINAL|CHANGED'; then
+  ok "as-of accepts a relative time"
+else
+  bad "as-of accepts a relative time"
+  printf '%s\n' "$AGO" | sed 's/^/       | /'
+fi
+
+"$V" as-of cli_asof 'not a time' >/dev/null 2>&1 \
+  && bad "as-of rejects an unparsable time" \
+  || ok "as-of rejects an unparsable time"
+
 printf '=== C4. history ===\n'
 "$V" history cli_orders '{"id":1}' >/dev/null 2>&1 && ok "history" || bad "history"
 HIST=$("$V" history cli_orders '{"id":1}' 2>&1)
