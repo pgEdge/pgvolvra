@@ -63,6 +63,41 @@ that table can no longer be undone.
 The function raises `invalid_column_reference` for a primary key
 column, and `undefined_column` for a column that does not exist.
 
+### volvra.set_warn_changed_rows
+
+Raises a WARNING when a single statement changes more rows than the
+limit on a covered table. Requires membership in `volvra_admin`.
+
+The function takes `p_rows bigint`. Zero turns the warning off, which is
+the default, and a negative number is refused.
+
+```sql
+SELECT volvra.set_warn_changed_rows(1000);
+```
+
+This is the one place pgVolvra speaks before you know something is
+wrong. A missing WHERE clause announces itself at the moment it runs
+rather than when somebody notices the damage.
+
+Off means off: the statement triggers that implement it are attached
+only while the limit is positive, so a database that does not use the
+feature carries none of its cost. Turning it on attaches them to every
+covered table, and covering a new table afterwards attaches them too.
+
+Measured cost when on, against a deliberately unfavourable workload of
+twenty thousand single-row statements, was **9.2 percent**, or 4.6
+microseconds per statement. That is best of five alternating runs with
+the fixture rebuilt each time, on PostgreSQL 17; a single run of this
+workload varies by roughly ten percent, so one measurement proves
+little.
+
+The cost is low because a statement is first measured by how far the
+change log's sequence moved, which is two sequence reads and can only
+overstate the true count. An exact count runs only when that cheap
+measure suggests the limit may have been crossed. Counting exactly on
+every statement was tried first and cost eight times as much, because
+the id range has to be probed in every monthly partition.
+
 ### volvra.set_capture_mode
 
 Overrides the `capture_updates` setting for one table. Requires

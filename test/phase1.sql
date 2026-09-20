@@ -809,5 +809,82 @@ END $$;
 
 DROP TRIGGER stamped_before ON stamped;
 
+-- ---------------------------------------------------------------------
+-- P1.16  Noticing a mistake as it is made.
+--
+-- The one place volvra can speak before you know something is wrong.
+-- Off by default, and off means the statement triggers are not attached
+-- at all: a user who does not want it must not pay for it.
+-- ---------------------------------------------------------------------
+\echo '--- P1.16 large-statement warning ---'
+DROP TABLE IF EXISTS loud;
+CREATE TABLE loud (id int PRIMARY KEY, v text);
+INSERT INTO loud SELECT g, 'x' FROM generate_series(1, 100) g;
+SELECT volvra.enable('loud');
+
+DO $$
+DECLARE v_n bigint;
+BEGIN
+  ASSERT coalesce(volvra.get_setting('warn_changed_rows'), '0') = '0',
+    'P1.16: the warning must be off by default';
+
+  SELECT count(*) INTO v_n FROM pg_trigger
+  WHERE tgrelid = 'loud'::regclass AND tgname LIKE 'volvra\_stmt%';
+  ASSERT v_n = 0,
+    format('P1.16: %s statement trigger(s) attached while off; off must cost '
+           'nothing', v_n);
+
+  PERFORM volvra.set_warn_changed_rows(10);
+  SELECT count(*) INTO v_n FROM pg_trigger
+  WHERE tgrelid = 'loud'::regclass AND tgname LIKE 'volvra\_stmt%';
+  ASSERT v_n = 2,
+    format('P1.16: expected both statement triggers after turning it on, got %s',
+           v_n);
+
+  -- A table covered while it is on must get the triggers too, or the
+  -- setting would quietly not apply to anything created later.
+  CREATE TABLE loud2 (id int PRIMARY KEY, v text);
+  PERFORM volvra.enable('loud2');
+  SELECT count(*) INTO v_n FROM pg_trigger
+  WHERE tgrelid = 'loud2'::regclass AND tgname LIKE 'volvra\_stmt%';
+  ASSERT v_n = 2,
+    'P1.16: a table covered while the warning is on must get the triggers';
+
+  PERFORM volvra.set_warn_changed_rows(0);
+  SELECT count(*) INTO v_n FROM pg_trigger
+  WHERE tgrelid = 'loud'::regclass AND tgname LIKE 'volvra\_stmt%';
+  ASSERT v_n = 0, 'P1.16: turning it off must remove the triggers again';
+END $$;
+
+DO $$
+DECLARE v_raised boolean := false;
+BEGIN
+  BEGIN
+    PERFORM volvra.set_warn_changed_rows(-1);
+  EXCEPTION WHEN OTHERS THEN v_raised := true;
+  END;
+  ASSERT v_raised, 'P1.16: a negative limit must be refused';
+END $$;
+
+-- The warning itself is a WARNING, which an assertion cannot catch, so it
+-- is asserted through its effect: the exact count runs only when the cheap
+-- sequence delta says the limit may have been crossed, and a small
+-- statement must leave the data untouched either way.
+DO $$
+DECLARE v_before bigint; v_after bigint;
+BEGIN
+  PERFORM volvra.set_warn_changed_rows(10);
+  SELECT count(*) INTO v_before FROM volvra.change_log WHERE table_name = 'public.loud';
+  UPDATE loud SET v = 'small' WHERE id <= 3;      -- under the limit, quiet
+  UPDATE loud SET v = 'large';                    -- over the limit, warns
+  SELECT count(*) INTO v_after FROM volvra.change_log WHERE table_name = 'public.loud';
+  ASSERT v_after - v_before = 103,
+    format('P1.16: the warning must not change what is captured; %s rows',
+           v_after - v_before);
+  PERFORM volvra.set_warn_changed_rows(0);
+END $$;
+
+DROP TABLE loud2;
+
 \echo ''
 \echo '*** ALL VOLVRA PHASE 1 CHECKS PASSED ***'

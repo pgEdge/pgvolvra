@@ -441,7 +441,21 @@ INSERT INTO volvra.settings(key, value) VALUES
   -- session_replication_role is 'replica', which is how bulk loaders and
   -- migration tools suppress triggers.  Turning it on unconditionally would
   -- change behaviour for single-node users who rely on that.
-  ('capture_replicated',       'off')
+  ('capture_replicated',       'off'),
+
+  -- warn_changed_rows: raise a WARNING when one statement changes more rows
+  -- than this on a covered table.  0 disables it.
+  --
+  -- volvra is otherwise entirely retrospective: it tells you what happened
+  -- once you already know something is wrong.  This is the one place it can
+  -- speak at the moment of the mistake, which is the difference between
+  -- noticing a missing WHERE clause at 15:40 and at 16:10.
+  --
+  -- Off by default, and deliberately not merely inert when off: the statement
+  -- triggers that implement it are attached only while it is on, so a user who
+  -- does not want the feature pays nothing for it.  Use
+  -- volvra.set_warn_changed_rows() to turn it on, which syncs the triggers.
+  ('warn_changed_rows',        '0')
   ON CONFLICT (key) DO NOTHING;
 
 -- ---------------------------------------------------------------------
@@ -1201,6 +1215,160 @@ $$;
 -- 'off' restores the default firing mode, which is also what a bulk loader
 -- setting session_replication_role = 'replica' expects: an ALWAYS trigger
 -- fires under that setting and an ordinary one does not.
+-- ---------------------------------------------------------------------
+-- Noticing a mistake as it is made
+--
+-- A row trigger cannot see how large a statement is: it fires once per row
+-- and knows nothing of its siblings.  Counting needs statement-level
+-- triggers, and the obvious way to do that -- REFERENCING NEW TABLE -- makes
+-- PostgreSQL materialise every changed row into a tuplestore, which is a real
+-- cost imposed on every covered write.
+--
+-- These use the change_log sequence instead.  A BEFORE STATEMENT trigger
+-- notes where the sequence stands; an AFTER STATEMENT trigger counts the rows
+-- this transaction wrote past that point.  The count is filtered by txid, so
+-- a concurrent session writing at the same time cannot inflate it.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION volvra._stmt_begin() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  PERFORM set_config('volvra.stmt_mark',
+                     coalesce(pg_sequence_last_value('volvra.change_log_id_seq'), 0)::text,
+                     true);   -- transaction-local
+  RETURN NULL;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION volvra._stmt_end() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_limit bigint := coalesce(volvra.get_setting('warn_changed_rows'), '0')::bigint;
+  v_mark  bigint := nullif(current_setting('volvra.stmt_mark', true), '')::bigint;
+  v_rows  bigint;
+BEGIN
+  IF v_limit <= 0 OR v_mark IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- How far the sequence moved is an upper bound on what this statement
+  -- wrote: concurrent sessions consume ids too, so the delta can only
+  -- overstate.  That makes it a safe cheap filter -- a statement under the
+  -- limit by this measure is certainly under it -- and it keeps the common
+  -- case, a small statement, to two sequence reads and no index scan.
+  --
+  -- Counting properly on every statement cost 8x on a workload of many
+  -- single-row updates, because the id range has to be probed in every
+  -- monthly partition.
+  IF coalesce(pg_sequence_last_value('volvra.change_log_id_seq'), 0) - v_mark
+     <= v_limit THEN
+    RETURN NULL;
+  END IF;
+
+  -- Only now is an exact answer worth paying for: the delta says this
+  -- statement may have crossed the line, and other sessions must not be
+  -- allowed to raise a warning about this one.  Stop at the limit; the exact
+  -- size of a runaway statement is not worth scanning a million rows for.
+  SELECT count(*) INTO v_rows
+  FROM (SELECT 1 FROM volvra.change_log c
+        WHERE c.id > v_mark AND c.txid = txid_current()
+        LIMIT v_limit + 1) AS counted;
+
+  IF v_rows > v_limit THEN
+    RAISE WARNING 'volvra: one statement changed more than % row(s) of %',
+      v_limit, format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME)
+      USING HINT = 'If that was not intended, volvra.preview_undo() will show '
+                   'exactly what it did while the rows are still recoverable.';
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+-- Attach or remove the statement triggers on one table, to match the setting.
+-- Kept separate so enable() and set_warn_changed_rows() cannot drift apart.
+CREATE OR REPLACE FUNCTION volvra._apply_stmt_triggers(target regclass)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_tbl text := volvra._fqname(target);
+  v_on  boolean := coalesce(volvra.get_setting('warn_changed_rows'), '0')::bigint > 0;
+BEGIN
+  IF v_on THEN
+    EXECUTE format(
+      'CREATE OR REPLACE TRIGGER volvra_stmt_begin '
+      'BEFORE INSERT OR UPDATE OR DELETE ON %s '
+      'FOR EACH STATEMENT EXECUTE FUNCTION volvra._stmt_begin()', v_tbl);
+    EXECUTE format(
+      'CREATE OR REPLACE TRIGGER volvra_stmt_end '
+      'AFTER INSERT OR UPDATE OR DELETE ON %s '
+      'FOR EACH STATEMENT EXECUTE FUNCTION volvra._stmt_end()', v_tbl);
+  ELSIF EXISTS (SELECT 1 FROM pg_trigger
+                WHERE tgrelid = target AND tgname IN ('volvra_stmt_begin',
+                                                      'volvra_stmt_end')) THEN
+    -- Guarded rather than IF EXISTS: enable() calls this on every covered
+    -- table, and a bare DROP ... IF EXISTS emits a NOTICE per trigger per
+    -- call.  The install is deliberately quiet, and noise that looks like a
+    -- problem is worse than no message at all.
+    EXECUTE format('DROP TRIGGER volvra_stmt_begin ON %s', v_tbl);
+    EXECUTE format('DROP TRIGGER volvra_stmt_end ON %s', v_tbl);
+  END IF;
+END
+$$;
+
+-- Turning the warning on or off has to reach every covered table, or the
+-- setting would describe a state the triggers do not implement.
+CREATE OR REPLACE FUNCTION volvra.set_warn_changed_rows(p_rows bigint)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  r       record;
+  v_n     bigint := 0;
+  v_fail  text[] := '{}';
+BEGIN
+  PERFORM volvra._require('volvra_admin');
+
+  IF p_rows < 0 THEN
+    RAISE EXCEPTION 'volvra.set_warn_changed_rows: % is negative', p_rows
+      USING HINT = '0 disables the warning; any positive number is a row limit.',
+            ERRCODE = 'invalid_parameter_value';
+  END IF;
+
+  PERFORM volvra.set_setting('warn_changed_rows', p_rows::text);
+
+  FOR r IN SELECT e.table_name FROM volvra.enabled_tables e ORDER BY e.table_name
+  LOOP
+    -- Best effort per table: altering a table needs ownership, and one table
+    -- owned by someone else must not stop the rest from being synced.
+    BEGIN
+      PERFORM volvra._apply_stmt_triggers(r.table_name::regclass);
+      v_n := v_n + 1;
+    EXCEPTION WHEN OTHERS THEN
+      v_fail := v_fail || r.table_name;
+    END;
+  END LOOP;
+
+  IF cardinality(v_fail) > 0 THEN
+    RAISE WARNING 'volvra: could not update statement triggers on %',
+      array_to_string(v_fail, ', ')
+      USING HINT = 'Altering a table requires ownership. Those tables keep '
+                   'their previous behaviour.';
+  END IF;
+
+  RETURN CASE WHEN p_rows = 0
+    THEN format('volvra: large-statement warning off (%s table(s) updated)', v_n)
+    ELSE format('volvra: warn when one statement changes more than %s row(s) '
+                '(%s table(s) updated)', p_rows, v_n)
+  END;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION volvra.set_capture_replicated(p_value text)
 RETURNS TABLE (table_name text, captures_replicated boolean)
 LANGUAGE plpgsql
@@ -1423,6 +1591,10 @@ BEGIN
   -- Adding it here is the difference between coverage and the appearance of
   -- coverage.
   PERFORM volvra._publish(v_tbl);
+
+  -- A table covered while the large-statement warning is on gets it too,
+  -- otherwise the setting would silently not apply to new tables.
+  PERFORM volvra._apply_stmt_triggers(target);
 
   -- Statement-level TRUNCATE triggers do not propagate to partitions the way
   -- row triggers do, so a partitioned table needs them attached explicitly.

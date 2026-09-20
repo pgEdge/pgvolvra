@@ -109,6 +109,7 @@ INSERT INTO pm_fn (fn, call_sql, tier) VALUES
   -- volvra_admin does not confer and deliberately should not.
   ('enable',               $$SELECT volvra.enable('pm.t')$$,                            'admin_owner'),
   ('enable_all',           $$SELECT count(*) FROM volvra.enable_all('pm_empty')$$,       'admin'),
+  ('set_warn_changed_rows',$$SELECT volvra.set_warn_changed_rows(0)$$,                 'admin'),
   ('disable_all',          $$SELECT count(*) FROM volvra.disable_all('pm_empty')$$,      'admin'),
   ('set_setting',          $$SELECT volvra.set_setting('strict_roles','off')$$,          'admin'),
   ('set_retention',        $$SELECT volvra.set_retention('pm.t','365 days')$$,           'admin'),

@@ -47,6 +47,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `volvra.set_warn_changed_rows(n)` raises a WARNING when one statement
+  changes more than `n` rows on a covered table, so a missing WHERE
+  clause announces itself as it runs instead of when somebody notices.
+  Off by default, and off means the statement triggers are not attached
+  at all, so a database that does not use it carries none of its cost.
 - `volvra.as_of(table, timestamp)` reconstructs a covered table as it
   stood at a past instant, read-only. It writes nothing, refuses on a
   table that was never covered rather than returning the present and

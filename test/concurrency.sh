@@ -330,6 +330,59 @@ SQL
     echo "  skip companion slot contention (set VOLVRA_COMPANION_BIN)"
   fi
 
+  # -----------------------------------------------------------------
+  # 6. The large-statement warning must measure THIS statement, not the
+  #    database.
+  #
+  #    It notes where the change_log sequence stands before a statement
+  #    and how far it moved after.  That sequence is shared, so another
+  #    session committing inside the window inflates the delta.  An
+  #    exact, txid-scoped count is what decides, and this proves it: the
+  #    small statement is held open deliberately so the bulk write can
+  #    allocate AND commit inside its window, which is the only moment
+  #    the race exists.  Remove `c.txid = txid_current()` from
+  #    volvra._stmt_end and this test fails.
+  # -----------------------------------------------------------------
+  sql <<'SQL'
+CREATE TABLE quiet (id int PRIMARY KEY, v int);
+CREATE TABLE noisy (id int PRIMARY KEY, v int);
+SELECT volvra.enable('quiet');
+SELECT volvra.enable('noisy');
+INSERT INTO quiet SELECT g, g FROM generate_series(1,20) g;
+INSERT INTO noisy SELECT g, g FROM generate_series(1,3000) g;
+SELECT volvra.set_warn_changed_rows(100);
+SQL
+
+  # The bulk write lands 0.4s in, well inside the window held open below.
+  ( sleep 0.4
+    docker exec "$C" psql -q -U postgres -d cc \
+      -c "UPDATE noisy SET v = v + 1" >>"$log" 2>&1 ) &
+  N_PID=$!
+
+  # Three rows, but the statement is deliberately slow: pg_sleep is
+  # evaluated per candidate row, holding the measurement window open long
+  # enough for the bulk write above to commit inside it.
+  Q_OUT=$(docker exec "$C" psql -U postgres -d cc \
+      -c "UPDATE quiet SET v = v + 1 WHERE id <= 3 AND pg_sleep(0.4)::text = ''" 2>&1)
+  wait "$N_PID" 2>/dev/null
+
+  if grep -q "changed more than" <<<"$Q_OUT"; then
+    bad "another session committing mid-statement cannot make 3 rows warn"
+    printf '%s\n' "$Q_OUT" | head -3 | sed 's/^/       | /'
+  else
+    ok "another session committing mid-statement cannot make 3 rows warn"
+  fi
+
+  # And the statement that really was large must still say so.
+  L_OUT=$(docker exec "$C" psql -U postgres -d cc \
+      -c "UPDATE noisy SET v = v + 1" 2>&1)
+  grep -q "changed more than" <<<"$L_OUT" \
+    && ok "while a genuinely large statement still warns" \
+    || bad "while a genuinely large statement still warns"
+
+  docker exec "$C" psql -q -U postgres -d cc \
+    -c "SELECT volvra.set_warn_changed_rows(0)" >>"$log" 2>&1
+
   docker rm -f "$C" >/dev/null 2>&1
 
   if [[ ${#problems[@]} -eq 0 ]]; then PASS+=("$v"); echo "  ✓ PASS"
