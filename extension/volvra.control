@@ -9,10 +9,10 @@ comment = 'Row-level undo and history for PostgreSQL'
 # The *product* version, deliberately NOT coupled to volvra.schema_version,
 # which is an internal migration counter -- see DECISIONS.md.
 #
-# 1.0.0-beta1 is the first public release.  Under semantic versioning it sorts
-# below 1.0.0, which is the GA it leads to.  Releasing as 1.x is a commitment:
-# after GA, a breaking change to the public functions needs a major bump.
-default_version = '1.0.0-beta1'
+# Under semantic versioning a -beta sorts below 1.0.0, which is the GA these
+# lead to.  Releasing as 1.x is a commitment: after GA, a breaking change to
+# the public functions needs a major bump.
+default_version = '1.0.0-beta2'
 relocatable = false
 superuser = false
 trusted = false

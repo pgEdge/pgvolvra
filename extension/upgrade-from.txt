@@ -2,15 +2,17 @@
 # upgrade *from*, one per line. Blank lines and # comments are ignored.
 #
 # extension/build.sh emits a volvra--<version>--<default_version>.sql for
-# every version listed here. The upgrade script is byte-identical to the
-# install script, because the installer is a version-aware migration runner:
-# it reads what a database already has and applies only what is missing.
+# every version listed here. Its body is the same as the install script,
+# because the installer is a version-aware migration runner: it reads what a
+# database already has and applies only what is missing. Only the header
+# differs, naming ALTER EXTENSION ... UPDATE rather than CREATE EXTENSION.
 #
 # At each release: bump default_version in volvra.control, then add the
 # version you just superseded to this file. Forgetting the second step leaves
 # extension-installed databases with no upgrade path, and ALTER EXTENSION
 # UPDATE refuses with "extension has no update path".
 #
-# 1.0.0-beta1 is the first release, and nothing preceded it, so this list is
-# empty. Add 1.0.0-beta1 here when default_version moves past it, or every
-# database that installed the beta as an extension will be stranded.
+# Add each released version here as default_version moves past it, or every
+# database that installed that version as an extension is stranded with
+# "extension has no update path".
+1.0.0-beta1
