@@ -195,25 +195,32 @@ and that is now in place:
   when accuracy matters, and the guess is unfalsifiable because the
   release it describes is gone. The tool refuses to overwrite an
   existing snapshot, because a released schema never changes.
-- **`test/run.sh` picks the highest-versioned fixture itself**, so
-  adding a snapshot is all it takes to make the upgrade test cover
-  that release.
+- **`test/run.sh` runs the upgrade test once per snapshot in
+  `test/releases/`**, each in a database of its own, so every released
+  version is proven to upgrade to the current code rather than only
+  the most recent one. Adding a snapshot is all it takes to extend the
+  coverage. Testing only the newest proved little: straight after a
+  release the newest snapshot *is* the code under test.
 - **The upgrade test is now release-to-release.** It seeds real
   history *and a seal* through the previous release's own capture
   path, then asserts the version ledger never goes backwards, every
   row and id survives, the seal chain still verifies with an unchanged
   head, and an undo driven entirely by pre-upgrade history restores
-  the row. With one release the fixture is the current schema, so this
-  proves reinstalling over live history is safe; it becomes a genuine
-  cross-version upgrade at release 2 with no change to the test.
+  the row. Since 1.0.0-beta2 this is a genuine cross-version upgrade:
+  the 1.0.0-beta1 fixture predates `volvra.as_of`, the statement-level
+  triggers and the quoted aliases. Running it against the newest
+  snapshot as well keeps proving that a reinstall over live history is
+  safe.
 - **`ALTER EXTENSION UPDATE` has a tested path.**
   `extension/build.sh` emits a `volvra--<from>--<to>.sql` for every
-  version in `extension/upgrade-from.txt`, byte-identical to the
-  install script because the installer is a version-aware migration
-  runner. `extension/test.sh` proves the machinery now, against a
-  synthetic older version it fabricates itself, rather than waiting
-  for release 2 to discover that extension-installed databases are
-  stranded.
+  released version, byte-identical to the install script because the
+  installer is a version-aware migration runner. The list of released
+  versions comes from the snapshots in `test/releases/`, so it cannot
+  fall out of step with the releases themselves.
+  `extension/test.sh` asserts that every snapshot has a path to the
+  current version, then proves the machinery against a synthetic older
+  version it fabricates itself, rather than waiting for release 2 to
+  discover that extension-installed databases are stranded.
 
 ## Priority 6: scenario coverage
 

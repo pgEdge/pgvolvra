@@ -251,27 +251,30 @@ for v in "${VERSIONS[@]}"; do
     docker exec "$cname" psql -v ON_ERROR_STOP=1 -U volvra_owner -d volvra_scenarios \
       -f /volvra/test/scenarios.sql
 
-    # Upgrade path: the newest released schema, real history and a seal, then
-    # the current schema installed over it twice.
+    # Upgrade path: a released schema, real history and a seal, then the
+    # current schema installed over it twice.
     #
-    # The snapshot is picked as the highest-versioned file in test/releases,
-    # rather than named here, so adding a release's snapshot is enough to make
-    # this test cover it.
+    # Every snapshot in test/releases is tested, not just the newest, and each
+    # gets a database of its own.  Testing only the newest proved very little:
+    # straight after a release the newest snapshot IS the code under test, so
+    # the suite was upgrading identical code to itself at exactly the moment
+    # upgrade coverage matters.  A user may be on any released version, so
+    # every released version has to reach the current one.
     echo "### upgrade ###"
-    SNAPSHOT="$(ls "$ROOT"/test/releases/volvra-*.sql 2>/dev/null \
-               | sort -V | tail -1)"
-    if [[ -z "$SNAPSHOT" ]]; then
-      echo "no release snapshot in test/releases -- run tools/snapshot-schema.sh"
-    else
-      echo "snapshot: $(basename "$SNAPSHOT")"
-      su_psql -c "CREATE DATABASE volvra_upgrade"
-      u() { docker exec "$cname" psql -v ON_ERROR_STOP=1 -U postgres -d volvra_upgrade "$@"; }
-      u -f "/volvra/test/releases/$(basename "$SNAPSHOT")"
+    for snap in "$ROOT"/test/releases/volvra-*.sql; do
+      [[ -e "$snap" ]] || { echo "no release snapshot in test/releases -- run tools/snapshot-schema.sh"; break; }
+      base="$(basename "$snap")"
+      from="${base#volvra-}"; from="${from%.sql}"
+      updb="volvra_upgrade_${from//[^a-zA-Z0-9]/_}"
+      echo "--- upgrade from $from (database $updb) ---"
+      su_psql -c "CREATE DATABASE $updb"
+      u() { docker exec "$cname" psql -v ON_ERROR_STOP=1 -U postgres -d "$updb" "$@"; }
+      u -f "/volvra/test/releases/$base"
       u -f /volvra/test/upgrade-seed.sql
       u -f /volvra/sql/volvra.sql
       u -f /volvra/sql/volvra.sql
       u -f /volvra/test/upgrade-verify.sql
-    fi
+    done
   } >>"$extra_log" 2>&1
   erc=$?
 
@@ -279,8 +282,7 @@ for v in "${VERSIONS[@]}"; do
   # marker from the skip path instead would turn "not tested" into "passed",
   # which is the failure mode this whole suite exists to avoid.
   extra_markers=('VOLVRA NON-SUPERUSER INSTALL PASSED'
-                 'ALL VOLVRA SCENARIO CHECKS PASSED'
-                 'VOLVRA UPGRADE PASSED')
+                 'ALL VOLVRA SCENARIO CHECKS PASSED')
   [[ -n "$CLI_BIN" ]] && extra_markers+=('ALL VOLVRA CLI CHECKS PASSED')
 
   emissing=()
@@ -288,11 +290,23 @@ for v in "${VERSIONS[@]}"; do
     grep -q "$m" "$extra_log" || emissing+=("$m")
   done
 
+  # The upgrade marker is counted, not just looked for: one pass would be
+  # indistinguishable from one snapshot passing and the rest never running.
+  want_upgrades="$(ls "$ROOT"/test/releases/volvra-*.sql 2>/dev/null | wc -l | tr -d ' ')"
+  got_upgrades="$(grep -c 'VOLVRA UPGRADE PASSED' "$extra_log" | tr -d ' ')"
+  if [[ "$want_upgrades" -eq 0 ]]; then
+    # An empty test/releases would otherwise make "nothing ran" look like
+    # "everything passed", which is the one result this suite must never give.
+    emissing+=("no release snapshot to upgrade from")
+  elif [[ "$got_upgrades" != "$want_upgrades" ]]; then
+    emissing+=("VOLVRA UPGRADE PASSED x$want_upgrades (got $got_upgrades)")
+  fi
+
   if [[ $erc -eq 0 && ${#emissing[@]} -eq 0 ]]; then
     if [[ -n "$CLI_BIN" ]]; then
-      echo "  ✓ extra: non-superuser install + cli + scenarios + upgrade"
+      echo "  ✓ extra: non-superuser install + cli + scenarios + upgrade x$want_upgrades"
     else
-      echo "  ✓ extra: non-superuser install + scenarios + upgrade (cli SKIPPED)"
+      echo "  ✓ extra: non-superuser install + scenarios + upgrade x$want_upgrades (cli SKIPPED)"
     fi
   else
     echo "  ✗ extra: FAILED (rc=$erc)${emissing[*]+, missing: ${emissing[*]}}"

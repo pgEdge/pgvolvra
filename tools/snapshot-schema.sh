@@ -43,5 +43,6 @@ mkdir -p "$ROOT/test/releases"
 
 echo "wrote $OUT ($(wc -l < "$OUT") lines)"
 echo
-echo "Next: add ${VERSION} to extension/upgrade-from.txt when default_version"
-echo "moves past it, so ALTER EXTENSION UPDATE has a path from ${VERSION}."
+echo "This snapshot is also what tells extension/build.sh that ${VERSION} is a"
+echo "released version, so the next release emits an ALTER EXTENSION UPDATE"
+echo "path from it.  Nothing further to add by hand."

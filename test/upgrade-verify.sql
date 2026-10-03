@@ -6,10 +6,10 @@
 -- intention: once a database holds history, an install that reshapes a
 -- table is data loss.
 --
--- When the fixture is the current release, this is a reinstall over live
--- history, which is the same property and worth asserting on its own. It
--- becomes a genuine cross-version upgrade at the next release, without any
--- change here.
+-- test/run.sh runs this once per snapshot in test/releases, each against a
+-- database of its own, so every released version is proven to reach the
+-- current code. For the newest snapshot the run is a reinstall over live
+-- history, which is a property worth asserting on its own.
 -- =====================================================================
 \set ON_ERROR_STOP on
 \pset pager off

@@ -217,14 +217,24 @@ cd extension
 The build removes stale generated scripts, because an old script still
 installs.
 
-The build also emits an upgrade script for every version listed in
-`extension/upgrade-from.txt`. An upgrade script is byte-identical to
-the install script, because the installer applies only the migrations
-a database is missing; it still has to exist under the right name, or
-`ALTER EXTENSION UPDATE` refuses and an extension-installed database
-is stranded on the version it has. `extension/test.sh` exercises that
-path against a synthetic older version it creates itself, so the
-machinery is proven before a second release depends on it.
+The build also emits an upgrade script for every released version,
+named `volvra--<from>--<to>.sql`. PostgreSQL reads the update paths an
+extension offers off those filenames, so a missing script makes
+`ALTER EXTENSION UPDATE` refuse and leaves an extension-installed
+database stranded on the version it has. An upgrade script is
+byte-identical to the install script, because the installer applies
+only the migrations a database is missing.
+
+The build derives the list of released versions from the snapshots in
+`test/releases/`, which `tools/snapshot-schema.sh` writes as part of
+cutting a release. Nothing has to be listed by hand. The build refuses
+to run if a snapshot is not below `default_version`, because a script
+generated from one would declare a downgrade path.
+
+`extension/test.sh` checks that every snapshot has an update path to
+the current version before it starts a container, then exercises
+`ALTER EXTENSION UPDATE` against a synthetic older version it creates
+itself.
 
 ## Releasing
 
@@ -232,19 +242,18 @@ The following steps make a release, in this order:
 
 1. Set `default_version` in `extension/volvra.control` to the new
     version.
-2. Add the version being superseded to
-    `extension/upgrade-from.txt`, so the build emits an upgrade script
-    from it.
-3. Run `./tools/snapshot-schema.sh`, which freezes the install script
-    as `test/releases/volvra-<version>.sql`. The next release's
-    upgrade test uses the snapshot, and the tool refuses to overwrite
-    one, because a released schema never changes.
-4. Run `make -C cli release` and `make -C companion release`, which
+2. Run `./tools/snapshot-schema.sh`, which freezes the install script
+    as `test/releases/volvra-<version>.sql`. The snapshot serves two
+    purposes: the next release's upgrade test runs against it, and it
+    is how `extension/build.sh` learns that this version was released
+    and needs an update path. The tool refuses to overwrite a
+    snapshot, because a released schema never changes.
+3. Run `make -C cli release` and `make -C companion release`, which
     build the two static binaries per component and their checksums.
-5. Run the full matrix, the examples, and the portability suite.
-6. Tag the release.
+4. Run the full matrix, the examples, and the portability suite.
+5. Tag the release.
 
-Step 3 is the one that is easy to skip and impossible to redo.
+Step 2 is the one that is easy to skip and impossible to redo.
 Reconstructing a released schema afterwards is guesswork exactly when
 accuracy matters, and the guess cannot be checked because the release
 it describes is gone.

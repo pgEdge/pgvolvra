@@ -89,13 +89,9 @@ extension version, and a later dump and restore then emits
 `CREATE EXTENSION volvra` at that stale version and loses the changes.
 
 `ALTER EXTENSION UPDATE` needs an upgrade script named for the version
-being left behind, which the packaging build produces for every version
-listed in `extension/upgrade-from.txt`. A release that omits the
-version it supersedes from that list leaves extension installs of it
-with no upgrade path, and `ALTER EXTENSION UPDATE` reports that the
-extension has no update path. Installing the newer packaging does not
-repair that, so the list is part of making a release rather than a
-detail of it.
+being left behind. The packaging build produces one for every released
+version, taking the list from the release snapshots in
+`test/releases/`, so a released version always has a path forward.
 
 Confirm which version PostgreSQL believes is installed:
 

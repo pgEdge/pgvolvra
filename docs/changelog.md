@@ -4,6 +4,34 @@ All notable changes to pgVolvra are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/), and pgVolvra
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The extension packaging no longer keeps a hand-written list of
+  released versions. `extension/build.sh` now derives the versions
+  that need an `ALTER EXTENSION UPDATE` path from the release
+  snapshots in `test/releases/`, which `tools/snapshot-schema.sh`
+  writes when a release is cut, and `extension/upgrade-from.txt` is
+  gone. A release no longer has a step that can be forgotten, and
+  forgetting it used to go unnoticed until the release after next.
+  `extension/test.sh` now fails if any released version lacks a path
+  to the current one.
+- The upgrade test runs once for every snapshot in `test/releases/`
+  rather than only the newest. Straight after a release the newest
+  snapshot is the code under test, so the old behavior proved almost
+  nothing at exactly the point where upgrade coverage matters.
+
+### Fixed
+
+- `extension/test.sh` no longer fails intermittently on a slow
+  container start. The script waited with `pg_isready`, which answers
+  yes while the postgres image is still running its init phase against
+  a temporary server, before `POSTGRES_DB` exists. The run then failed
+  with `database "ext" does not exist`, which reads as a product
+  failure and is not one. The script now uses `volvra_wait_ready` from
+  `test/lib.sh`, as the rest of the suites already did.
+
 ## [1.0.0-beta2] - 2026-09-21
 
 ### Fixed

@@ -5,6 +5,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/test/lib.sh"
 VER="${1:-17}"
 IMG="postgres:$VER"; [[ "$VER" == "19" ]] && IMG="postgres:19beta1"
 C="volvra-ext-$$"
@@ -16,12 +17,50 @@ VERSION="$(sed -n "s/^default_version = '\(.*\)'/\1/p" "$ROOT/extension/volvra.c
 [[ -f "$ROOT/extension/volvra--${VERSION}.sql" ]] \
   || { echo "run extension/build.sh first"; exit 1; }
 
+# ---------------------------------------------------------------------
+# Every released version must have an update path to this one.
+#
+# PostgreSQL reads the paths an extension offers off the filenames in
+# SHAREDIR/extension, so a missing file is not an error until someone runs
+# ALTER EXTENSION UPDATE on a database installed from that version -- in
+# production, one release too late to fix.  Checking it here turns the
+# omission into a failed build instead.
+#
+# test/releases holds one frozen snapshot per release, so it is the list of
+# versions that exist in the wild.  Asserting against it, rather than against
+# whatever build.sh happened to derive, means the two would have to be wrong
+# in the same way to pass.
+# ---------------------------------------------------------------------
+missing=()
+shopt -s nullglob
+for snap in "$ROOT"/test/releases/volvra-*.sql; do
+  from="$(basename "$snap")"; from="${from#volvra-}"; from="${from%.sql}"
+  [[ "$from" == "$VERSION" ]] && continue
+  [[ -f "$ROOT/extension/volvra--${from}--${VERSION}.sql" ]] || missing+=("$from")
+done
+shopt -u nullglob
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "!!! no update path to $VERSION from released version(s): ${missing[*]}"
+  echo "    extension/build.sh should have emitted one per snapshot in"
+  echo "    test/releases/; databases installed from those versions would be"
+  echo "    stranded with \"extension has no update path\"."
+  exit 1
+fi
+echo "update paths present for: $(ls "$ROOT"/extension/volvra--*--*.sql 2>/dev/null \
+                                  | wc -l | tr -d ' ') released version(s)"
+
 echo "▶ CREATE EXTENSION volvra on $IMG"
 docker run -d --name "$C" -e POSTGRES_PASSWORD=e -e POSTGRES_DB=ext \
   -v "$ROOT:/volvra:ro" "$IMG" >/dev/null
-for _ in $(seq 1 60); do
-  docker exec "$C" pg_isready -U postgres -d ext >/dev/null 2>&1 && break; sleep 1
-done
+
+# pg_isready is not enough here.  The postgres image runs initdb against a
+# temporary server so the init scripts can run, and pg_isready answers yes
+# during that window -- before POSTGRES_DB exists.  Connecting then fails with
+# 'database "ext" does not exist', which reads as a product failure and is not
+# one.  volvra_wait_ready requires two consecutive real queries instead; the
+# rest of the suite has used it for exactly this reason since it cost two CI
+# jobs.
+volvra_wait_ready "$C" ext || { echo "!!! server never became ready"; exit 1; }
 
 SHAREDIR="$(docker exec "$C" pg_config --sharedir)"
 docker exec "$C" bash -c "cp /volvra/extension/volvra.control '$SHAREDIR/extension/' && \
