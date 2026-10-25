@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -56,8 +54,8 @@ func quoteLiteral(s string) string {
 	return string(append(out, '\''))
 }
 
-func RestoreArchive(ctx context.Context, dir, dsn string, dry bool) (int64, int64, error) {
-	m, err := ReadManifest(dir)
+func RestoreArchive(ctx context.Context, src Source, dsn string, dry bool) (int64, int64, error) {
+	m, err := ReadManifestFrom(ctx, src)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -73,7 +71,7 @@ func RestoreArchive(ctx context.Context, dir, dsn string, dry bool) (int64, int6
 
 	var loaded, skipped int64
 	for _, seg := range m.Segments {
-		f, err := os.Open(filepath.Join(dir, seg.File))
+		f, err := src.Open(ctx, seg.File)
 		if err != nil {
 			return loaded, skipped, err
 		}

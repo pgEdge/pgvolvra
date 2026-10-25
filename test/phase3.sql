@@ -11,12 +11,26 @@
 SELECT version, note FROM volvra.schema_version ORDER BY version;
 
 DO $$ BEGIN
-  -- Nothing has been released, so there is exactly one schema version.
-  ASSERT volvra.version() = 1,
-    format('an unreleased product has one schema version, got %s', volvra.version());
-  ASSERT (SELECT count(*) FROM volvra.schema_version) = 1,
-    'the ledger records one version, not one row per development step';
+  -- The ledger records one row per SCHEMA version, which is not the product
+  -- version and does not move with it: it increments only when the on-disk
+  -- shape changes.  So this asserts the shape of the ledger, not a particular
+  -- number.  It used to assert exactly 1, on the premise that nothing had been
+  -- released; two releases later that premise was false and the assertion
+  -- failed for the only reason it ever could, which is that the premise had
+  -- expired rather than that anything was wrong.
+  ASSERT volvra.version() >= 1, 'the schema is installed';
+  ASSERT (SELECT count(*) FROM volvra.schema_version)
+         = (SELECT count(DISTINCT version) FROM volvra.schema_version),
+    'no version is recorded twice';
+  ASSERT (SELECT count(*) FROM volvra.schema_version) = volvra.version(),
+    format('the ledger holds one row per version up to %s, found %s row(s) -- '
+           'a row per development step would show up here',
+           volvra.version(), (SELECT count(*) FROM volvra.schema_version));
+  ASSERT (SELECT bool_and(note IS NOT NULL AND note <> '')
+          FROM volvra.schema_version),
+    'every version says what it changed';
   ASSERT volvra._at_least(1), '_at_least agrees';
+  ASSERT volvra._at_least(volvra.version()), 'and agrees at the current version';
   ASSERT NOT volvra._at_least(999), 'and does not over-claim';
 END $$;
 

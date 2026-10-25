@@ -33,9 +33,19 @@ const usage = `volvra-companion -- durable change archive for PostgreSQL
 
   volvra-companion run     --dsn DSN --archive DIR [--slot NAME] [--publication NAME]
                            [--segment-bytes N] [--lag-warn N] [--lag-max N]
-  volvra-companion verify  --archive DIR
+                           [--s3-bucket NAME --s3-endpoint HOST [--s3-prefix P]]
+                           [--s3-checksum auto|server|readback]
+  volvra-companion verify  --archive DIR [--s3-bucket NAME --s3-endpoint HOST]
   volvra-companion restore --archive DIR --dsn DSN [--dry-run]
   volvra-companion status  --dsn DSN
+
+Object storage is optional and additive. Segments are still written to local
+disk and fsynced there; a segment is uploaded after it rotates, and the
+replication slot does not advance past a segment the bucket has not confirmed.
+Credentials come from the environment or an instance role, never from a flag.
+
+Pass --archive "" with --s3-bucket to read an archive from a bucket alone,
+which is the case this tier exists for: the host that wrote it is gone.
 
 The archive is newline-delimited JSON in numbered segments, described by a
 manifest that chains their SHA-256 hashes. It is readable without this binary
@@ -64,19 +74,32 @@ func main() {
 	lagWarn := fs.Int64("lag-warn", 512<<20, "warn when the slot retains this much WAL")
 	lagMax := fs.Int64("lag-max", 5<<30, "advance the slot past this, recording a gap")
 	dry := fs.Bool("dry-run", false, "restore: parse and count, change nothing")
+	s3Bucket := fs.String("s3-bucket", "", "upload segments to this bucket")
+	s3Endpoint := fs.String("s3-endpoint", "", "S3 endpoint host[:port], no scheme")
+	s3Prefix := fs.String("s3-prefix", "", "key prefix within the bucket")
+	s3Region := fs.String("s3-region", "us-east-1", "bucket region")
+	s3Insecure := fs.Bool("s3-insecure", false, "plain HTTP; for a local test server only")
+	s3Checksum := fs.String("s3-checksum", "auto",
+		"how uploads are verified: auto, server, or readback (auto picks readback "+
+			"for Google Cloud Storage, which rejects trailing-header checksums)")
 	_ = fs.Parse(os.Args[2:])
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	ropts := RemoteOptions{
+		Endpoint: *s3Endpoint, Bucket: *s3Bucket, Prefix: *s3Prefix,
+		Region: *s3Region, Insecure: *s3Insecure, Checksum: *s3Checksum,
+	}
+
 	var err error
 	switch cmd {
 	case "run":
-		err = cmdRun(ctx, *dsn, *archive, *slot, *pub, *segBytes, *lagWarn, *lagMax)
+		err = cmdRun(ctx, *dsn, *archive, *slot, *pub, *segBytes, *lagWarn, *lagMax, ropts)
 	case "verify":
-		err = cmdVerify(*archive)
+		err = cmdVerify(ctx, *archive, ropts)
 	case "restore":
-		err = cmdRestore(ctx, *archive, *dsn, *dry)
+		err = cmdRestore(ctx, *archive, *dsn, *dry, ropts)
 	case "status":
 		err = cmdStatus(ctx, *dsn)
 	case "help", "-h", "--help":
@@ -91,6 +114,50 @@ func main() {
 	}
 }
 
+// openSource resolves where the archive is read from and written to, and says
+// out loud what object storage will do to the data.
+//
+// The announcement is not decoration. If the bucket makes objects immutable,
+// then volvra.forget cannot erase the archived copy, and the person who turns
+// this on is the person who needs to know that before a subject exercises a
+// right to erasure. Saying it at startup, and recording it in the database, is
+// how that reaches them rather than sitting in a document nobody opened.
+func openSource(ctx context.Context, dir string, o RemoteOptions) (Source, error) {
+	src := Source{Dir: dir}
+	if o.Bucket == "" {
+		if dir == "" {
+			return src, fmt.Errorf("--archive is required")
+		}
+		return src, nil
+	}
+	r, err := NewRemote(ctx, o)
+	if err != nil {
+		return src, err
+	}
+	src.Remote = r
+
+	if r.Checksum() == "readback" {
+		// Worth saying out loud: this doubles the bytes moved per segment, and
+		// on a provider that bills egress that is a real recurring cost rather
+		// than a detail of the implementation.
+		log.Printf("NOTICE: uploads are verified by reading each segment back, "+
+			"which doubles the traffic per segment (%s)", r.URI())
+	}
+
+	if l := r.Lock(); l.Enabled {
+		log.Printf("NOTICE: this bucket enforces object lock on %s: %s", r.URI(), l)
+		log.Printf("NOTICE: objects archived here cannot be deleted or overwritten for %d day(s)",
+			l.Days)
+		if l.Mode == "COMPLIANCE" {
+			log.Printf("WARNING: COMPLIANCE mode cannot be bypassed by anyone, including " +
+				"the account root")
+		}
+		log.Printf("WARNING: volvra.forget() redacts history in the database; it cannot " +
+			"erase an archived object while that retention stands")
+	}
+	return src, nil
+}
+
 func require(name, v string) error {
 	if v == "" {
 		return fmt.Errorf("--%s is required", name)
@@ -99,7 +166,7 @@ func require(name, v string) error {
 }
 
 func cmdRun(ctx context.Context, dsn, dir, slot, pub string,
-	segBytes, lagWarn, lagMax int64) error {
+	segBytes, lagWarn, lagMax int64, o RemoteOptions) error {
 
 	if err := require("dsn", dsn); err != nil {
 		return err
@@ -113,6 +180,24 @@ func cmdRun(ctx context.Context, dsn, dir, slot, pub string,
 		return err
 	}
 	defer arch.Close()
+
+	src, err := openSource(ctx, dir, o)
+	if err != nil {
+		return err
+	}
+	if src.Remote != nil {
+		arch.UseRemote(src.Remote)
+		// Finish what a previous run started. A segment uploaded but not
+		// recorded, or recorded but never uploaded, is the normal residue of a
+		// crash, and the slot is being held back by it until this succeeds.
+		if n := arch.PendingUploads(); n > 0 {
+			log.Printf("%d segment(s) not yet in %s, uploading before streaming",
+				n, src.Remote.URI())
+		}
+		if err := arch.PushRemote(ctx); err != nil {
+			return fmt.Errorf("could not reach the bucket at startup: %w", err)
+		}
+	}
 
 	st, err := NewStreamer(ctx, dsn, slot, pub, arch, nil)
 	if err != nil {
@@ -134,6 +219,11 @@ func cmdRun(ctx context.Context, dsn, dir, slot, pub string,
 	}
 
 	abs, _ := filepath.Abs(dir)
+	if src.Remote != nil {
+		// The database records where the archive really lives, so someone
+		// reading volvra.companion_checkpoint can find it without this host.
+		abs = src.Remote.URI()
+	}
 	st.guard = &SlotGuard{
 		meta: st.meta, repl: st.repl, slot: slot,
 		warnBytes: lagWarn, maxBytes: lagMax, arch: arch,
@@ -161,7 +251,24 @@ func cmdRun(ctx context.Context, dsn, dir, slot, pub string,
 		}
 	}
 
-	log.Printf("archiving slot %s to %s", slot, abs)
+	// Tell the database what object storage will do to the archive, so that
+	// volvra.forget() and volvra.preflight() can say it to the person who
+	// needs to hear it. Best effort: an older database has no such function,
+	// and that must not stop the companion from archiving.
+	if src.Remote != nil {
+		if l := src.Remote.Lock(); l.Enabled {
+			res := st.meta.ExecParams(ctx,
+				"SELECT volvra.companion_report_immutable($1,$2,$3,$4)",
+				[][]byte{[]byte(slot), []byte(l.Mode),
+					[]byte(fmt.Sprint(l.Days)), []byte(l.Source)},
+				nil, nil, nil).Read()
+			if res.Err != nil {
+				log.Printf("note: could not record the object lock state: %v", res.Err)
+			}
+		}
+	}
+
+	log.Printf("archiving slot %s to %s", slot, src.describe())
 	err = st.Run(ctx, start, report)
 	if cerr := arch.Close(); cerr != nil && err == nil {
 		err = cerr
@@ -173,11 +280,12 @@ func cmdRun(ctx context.Context, dsn, dir, slot, pub string,
 	return err
 }
 
-func cmdVerify(dir string) error {
-	if err := require("archive", dir); err != nil {
+func cmdVerify(ctx context.Context, dir string, o RemoteOptions) error {
+	src, err := openSource(ctx, dir, o)
+	if err != nil {
 		return err
 	}
-	findings, m, err := VerifyArchive(dir)
+	findings, m, err := VerifyArchive(ctx, src)
 	if err != nil {
 		return err
 	}
@@ -186,7 +294,7 @@ func cmdVerify(dir string) error {
 	for _, s := range m.Segments {
 		changes += s.Changes
 	}
-	fmt.Printf("archive  %s\n", dir)
+	fmt.Printf("archive  %s\n", src.describe())
 	fmt.Printf("slot     %s\n", m.Slot)
 	fmt.Printf("segments %d\n", len(m.Segments))
 	fmt.Printf("changes  %d\n", changes)
@@ -218,8 +326,9 @@ func cmdVerify(dir string) error {
 	return fmt.Errorf("archive verification failed")
 }
 
-func cmdRestore(ctx context.Context, dir, dsn string, dry bool) error {
-	if err := require("archive", dir); err != nil {
+func cmdRestore(ctx context.Context, dir, dsn string, dry bool, o RemoteOptions) error {
+	src, err := openSource(ctx, dir, o)
+	if err != nil {
 		return err
 	}
 	if !dry {
@@ -230,7 +339,7 @@ func cmdRestore(ctx context.Context, dir, dsn string, dry bool) error {
 
 	// Never load an archive that does not verify: a restore is exactly the
 	// moment its integrity matters.
-	findings, _, err := VerifyArchive(dir)
+	findings, _, err := VerifyArchive(ctx, src)
 	if err != nil {
 		return err
 	}
@@ -243,7 +352,7 @@ func cmdRestore(ctx context.Context, dir, dsn string, dry bool) error {
 		return fmt.Errorf("refusing to restore an archive that does not verify")
 	}
 
-	loaded, skipped, err := RestoreArchive(ctx, dir, dsn, dry)
+	loaded, skipped, err := RestoreArchive(ctx, src, dsn, dry)
 	if err != nil {
 		return err
 	}

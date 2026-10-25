@@ -74,6 +74,13 @@ for _ in $(seq 1 40); do
 done
 [[ -f "$ARCHIVE/manifest.json" ]] && ok "archive opened" || bad "archive opened"
 
+# The manifest exists before the slot does, and a write issued in that window
+# never reaches the stream. Wait for the slot, which is the real signal.
+for _ in $(seq 1 60); do
+  [[ "$(q -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name='volvra_companion' AND active")" == "1" ]] && break
+  sleep 0.5
+done
+
 qq <<'SQL'
 UPDATE accounts SET balance = 0;
 DELETE FROM accounts WHERE id = 3;

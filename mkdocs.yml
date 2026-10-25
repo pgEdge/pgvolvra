@@ -78,6 +78,7 @@ nav:
       - Performance: performance.md
   - Using the Durable Tier:
       - Companion Overview: companion.md
+      - Where the Archive Is Stored: archive_storage.md
       - Companion Reference: companion_reference.md
   - Security: security.md
   - Function Reference: function_reference.md

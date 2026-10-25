@@ -91,6 +91,8 @@ INSERT INTO pm_fn (fn, call_sql, tier) VALUES
   ('companion_status',     $$SELECT count(*) FROM volvra.companion_status()$$,           'viewer'),
   ('companion_report',     $$SELECT volvra.companion_report('pm_slot','0/1',0,0,NULL)$$, 'viewer'),
   ('companion_record_gap', $$SELECT volvra.companion_record_gap('pm_slot','0/1','0/2','pm','pm')$$, 'viewer'),
+  ('companion_report_immutable',
+     $$SELECT volvra.companion_report_immutable('pm_slot','GOVERNANCE',1,'pm')$$, 'viewer'),
   -- viewer, but also needs SELECT on the table
   ('history',              $$SELECT count(*) FROM volvra.history('pm.t','{"id":1}')$$,  'viewer_table'),
   ('preview_undo',         $$SELECT count(*) FROM volvra.preview_undo('pm.t','2000-01-01','2000-01-02')$$, 'viewer_table'),

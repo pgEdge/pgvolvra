@@ -341,6 +341,31 @@ CREATE TABLE IF NOT EXISTS volvra.companion_checkpoint (
   archive_uri   text
 );
 
+-- Object storage can make an archived object immutable for a retention
+-- period, and then nothing -- not this database, not the account root under
+-- COMPLIANCE -- can delete or overwrite it.
+--
+-- That is a feature when the question is "prove nobody edited the audit
+-- trail".  It is a problem when the question is "a subject asked to be
+-- forgotten", because volvra.forget() redacts the history here and cannot
+-- reach the archived copy at all.
+--
+-- The companion reports the condition so that the person running forget() is
+-- told at the moment they run it.  Writing it in a document instead would put
+-- the warning somewhere other than where the decision is made.
+ALTER TABLE volvra.companion_checkpoint
+  ADD COLUMN IF NOT EXISTS immutable_mode   text;
+ALTER TABLE volvra.companion_checkpoint
+  ADD COLUMN IF NOT EXISTS immutable_days   int;
+ALTER TABLE volvra.companion_checkpoint
+  ADD COLUMN IF NOT EXISTS immutable_source text;
+ALTER TABLE volvra.companion_checkpoint
+  ADD COLUMN IF NOT EXISTS immutable_seen_at timestamptz;
+
+INSERT INTO volvra.schema_version (version, note)
+VALUES (2, 'companion_checkpoint records object-lock retention')
+ON CONFLICT (version) DO NOTHING;
+
 -- A gap is history the companion could not archive.  Recorded rather than
 -- silent, for the same reason retention and erasure are: an unexplained hole
 -- must be distinguishable from a lawful one.
@@ -3510,6 +3535,7 @@ DECLARE
   v_from bigint;
   v_to   bigint;
   v_n    bigint;
+  r      record;
 BEGIN
   PERFORM volvra._require('volvra_admin');
 
@@ -3549,6 +3575,34 @@ BEGIN
   END IF;
 
   PERFORM set_config('volvra.allow_purge', 'off', true);
+
+  -- The erasure above covers the history in THIS database.  If the companion
+  -- is archiving to object storage that enforces a retention, the archived
+  -- copy of these same rows cannot be erased until that retention expires,
+  -- and under COMPLIANCE mode it cannot be erased by anyone at all.
+  --
+  -- Said here, at the moment of the request, because this is where the
+  -- decision is made.  A caller acting on a right-to-erasure request has to
+  -- know that the obligation is only partly discharged.
+  FOR r IN
+    SELECT slot_name, archive_uri, immutable_mode, immutable_days
+    FROM volvra.companion_checkpoint
+    WHERE immutable_mode IS NOT NULL
+  LOOP
+    RAISE WARNING 'volvra: the archived copy of this history is immutable'
+      USING DETAIL = format(
+              'slot %s archives to %s under object lock %s for %s day(s); '
+              'those objects cannot be deleted or overwritten while the '
+              'retention stands',
+              r.slot_name, coalesce(r.archive_uri, 'object storage'),
+              r.immutable_mode, coalesce(r.immutable_days::text, '?')),
+            HINT = CASE WHEN r.immutable_mode = 'COMPLIANCE'
+                   THEN 'COMPLIANCE retention cannot be bypassed by anyone, '
+                        'including the account root. Erasure of the archived '
+                        'copy is not possible until it expires.'
+                   ELSE 'GOVERNANCE retention can be bypassed by a caller '
+                        'holding s3:BypassGovernanceRetention.' END;
+  END LOOP;
 
   mode        := CASE WHEN hard THEN 'hard' ELSE 'redact' END;
   rows_erased := v_n;
@@ -4272,6 +4326,14 @@ BEGIN
     IF v_ck.archive_uri IS NOT NULL THEN
       item := 'archive'; value := v_ck.archive_uri; status := 'ok'; RETURN NEXT;
     END IF;
+    IF v_ck.immutable_mode IS NOT NULL THEN
+      item  := 'object lock';
+      value := format('%s, %s day(s)', v_ck.immutable_mode,
+                      coalesce(v_ck.immutable_days::text, '?'));
+      status := 'archived objects cannot be deleted or overwritten while the '
+                'retention stands -- volvra.forget() cannot reach them';
+      RETURN NEXT;
+    END IF;
   END IF;
 
   SELECT count(*) INTO v_ret FROM volvra.companion_gap WHERE slot_name = v_slot;
@@ -4305,6 +4367,38 @@ BEGIN
         segments     = EXCLUDED.segments,
         changes      = EXCLUDED.changes,
         archive_uri  = coalesce(EXCLUDED.archive_uri, c.archive_uri);
+END
+$$;
+
+-- Reported by the companion when the archive's object storage enforces a
+-- retention. pgVolvra never sets one; this records a policy the bucket
+-- already imposes, which is the case that actually arises.
+--
+-- Deliberately a function of its own rather than more parameters on
+-- companion_report: a newer companion must keep working against an older
+-- database, and adding parameters there would break every existing call.
+CREATE OR REPLACE FUNCTION volvra.companion_report_immutable(
+  p_slot   text,
+  p_mode   text,
+  p_days   int,
+  p_source text DEFAULT NULL)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  -- Upsert, because the companion reports this at startup, before it has
+  -- checkpointed anything. An UPDATE would match no row on a first run and
+  -- lose the one fact this function exists to record.
+  INSERT INTO volvra.companion_checkpoint AS c
+    (slot_name, archived_lsn, immutable_mode, immutable_days, immutable_source,
+     immutable_seen_at)
+  VALUES (p_slot, '0/0', p_mode, p_days, p_source, clock_timestamp())
+  ON CONFLICT (slot_name) DO UPDATE
+    SET immutable_mode    = EXCLUDED.immutable_mode,
+        immutable_days    = EXCLUDED.immutable_days,
+        immutable_source  = EXCLUDED.immutable_source,
+        immutable_seen_at = EXCLUDED.immutable_seen_at;
 END
 $$;
 
@@ -4419,6 +4513,8 @@ DECLARE
   v_repl  boolean := false;
   v_owner    text;
   v_n        bigint;
+  v_lock_mode text;
+  v_lock_days int;
 BEGIN
   PERFORM volvra._require('volvra_viewer');
 
@@ -4437,6 +4533,26 @@ BEGIN
                 'production.';
     RETURN NEXT;
   END IF;
+
+  -- An immutable archive is a deliberate choice, not a fault, so this is a
+  -- warning rather than a finding against the install.  It is reported at all
+  -- because it changes what volvra.forget() can promise, and someone auditing
+  -- this database for a data-protection obligation needs to see it here
+  -- rather than discover it from a provider console.
+  FOR v_lock_mode, v_lock_days IN
+    SELECT c.immutable_mode, c.immutable_days
+    FROM volvra.companion_checkpoint c
+    WHERE c.immutable_mode IS NOT NULL
+  LOOP
+    severity := 'warning';
+    finding  := format('the archive is under object lock (%s, %s day(s))',
+                       v_lock_mode, coalesce(v_lock_days::text, '?'));
+    detail   := 'Archived history cannot be deleted or overwritten while the '
+                'retention stands, so volvra.forget() erases the copy in this '
+                'database only. Under COMPLIANCE mode nobody can erase the '
+                'archived copy, including the account root.';
+    RETURN NEXT;
+  END LOOP;
 
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'volvra_viewer') THEN
     severity := 'critical';

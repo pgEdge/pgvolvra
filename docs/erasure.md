@@ -111,6 +111,23 @@ The following table compares the two approaches:
 | exclude_columns | The data must never be recorded at all. | That column can never be restored. |
 | forget | The data was recorded and must now be removed. | Changes for that subject can no longer be undone. |
 
+
+## Erasure and an immutable archive
+
+`volvra.forget` erases history in this database. If the companion
+archives to object storage under an S3 Object Lock retention, the
+archived copy of the same rows cannot be deleted or overwritten while
+that retention stands, and under compliance mode it cannot be erased by
+anyone, including the account root.
+
+pgVolvra raises a warning from `volvra.forget` whenever a lock is in
+force, naming the archive and the retention, and `volvra.preflight`
+reports the same condition. Treat an erasure request as only partly
+satisfied until the archived copy is also dealt with.
+
+The Where the Archive Is Stored document describes the setting and the
+trade it involves.
+
 ## Next Steps
 
 - The [Verifying History Integrity](integrity.md) document explains

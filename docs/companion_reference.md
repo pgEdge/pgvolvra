@@ -71,8 +71,36 @@ The following table describes each flag the command accepts:
 | --segment-bytes | 67108864, which is 64 MB | Rotate to a new segment once the current one reaches this size. |
 | --lag-warn | 536870912, which is 512 MB | Log a warning once the slot retains this much write-ahead log. |
 | --lag-max | 5368709120, which is 5 GB | Advance the slot past this volume and record the skipped range as a gap. |
+| --s3-bucket | None | Upload rotated segments to this bucket. Object storage is off when unset. |
+| --s3-endpoint | None | The S3 endpoint host, with no scheme. Required with --s3-bucket. |
+| --s3-prefix | None | A key prefix within the bucket. |
+| --s3-region | us-east-1 | The bucket region. |
+| --s3-insecure | Off | Use plain HTTP. For a local test server only; it disables TLS. |
+| --s3-checksum | auto | How an upload is verified: auto, server, or readback. Auto selects readback for Google Cloud Storage and server checksums elsewhere. |
 
 The command requires `--dsn` and `--archive`.
+
+## Object storage
+
+Credentials are never taken as flags, because a flag puts them in the
+process list and in shell history. The companion reads them from the
+environment, the shared credentials file, or an instance or workload
+identity role.
+
+With a bucket configured, the replication slot does not advance past a
+segment the bucket has not confirmed, so a bucket outage retains
+write-ahead log rather than releasing it.
+
+Google Cloud Storage rejects the aws-chunked trailing header that
+carries a server-side checksum, so `--s3-checksum` defaults to `auto`
+and selects read-back verification for `storage.googleapis.com`.
+Read-back downloads each segment after uploading it, which doubles the
+traffic; the companion says so at startup.
+
+pgVolvra never sets an object lock retention. If the bucket enforces
+one, the companion detects it and reports it, because `volvra.forget`
+cannot erase an archived object while a retention stands. The Where the
+Archive Is Stored document explains the consequences.
 
 ## How run acknowledges progress
 
@@ -97,6 +125,17 @@ The command prints the archive path, the slot, the segment count, and
 the change count, then either confirms the archive or lists one
 finding per problem segment. The command exits non-zero when any
 finding is present.
+
+### Reading from a bucket
+
+`verify` and `restore` accept the same `--s3-*` flags as `run`. Pass an
+empty `--archive` to read the bucket alone, which is what a host loss
+leaves you with:
+
+```bash
+volvra-companion verify --archive "" \
+  --s3-bucket my-archive --s3-endpoint s3.us-east-1.amazonaws.com
+```
 
 ## The restore command
 

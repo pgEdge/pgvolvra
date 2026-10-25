@@ -6,6 +6,48 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Native object storage for the companion archive. The companion
+  uploads each segment to S3-compatible storage after the segment
+  rotates, comparing the provider's checksum against the hash the
+  manifest already chained before recording the segment as archived.
+  Local disk remains the write path, so every existing durability
+  guarantee is unchanged, and uploaded segments are kept locally so
+  verification still works with no network. One client covers AWS S3,
+  Cloudflare R2, Backblaze B2, Wasabi, MinIO and Google Cloud Storage
+  through its S3 interoperability endpoint.
+- The replication slot now waits for the bucket. With object storage
+  configured, the slot does not advance past a segment the bucket has
+  not confirmed, because releasing write-ahead log for data held only
+  on a host that then dies is the failure this tier exists to prevent.
+  A bucket outage retains write-ahead log and is reported; `--lag-max`
+  remains the ceiling at which a gap is recorded instead.
+- `verify` and `restore` read from the bucket when the local archive is
+  absent. Pass an empty `--archive` to work from object storage alone,
+  which is what a host loss leaves behind.
+- Reporting of a bucket that enforces S3 Object Lock. pgVolvra never
+  sets a retention and offers no flag to; it detects the policy the
+  bucket already enforces and says what that costs. Because a locked
+  object cannot be erased, and `volvra.forget` is documented for
+  right-to-erasure requests, the conflict is reported rather than
+  documented and forgotten: the companion reports it at startup,
+  `volvra.forget` warns every time it runs while a retention is in
+  force, `volvra.preflight` reports the condition, and
+  `volvra.companion_status` shows the mode and duration.
+- Google Cloud Storage support through its S3 interoperability
+  endpoint, which needs no separate client. GCS does not implement the
+  aws-chunked trailing header that carries a server-side checksum, and
+  an upload asking for one there fails rather than degrading, so
+  `--s3-checksum` defaults to `auto` and selects read-back verification
+  for `storage.googleapis.com`. Read-back downloads each segment after
+  uploading it to hash it locally, which doubles the traffic and is
+  announced at startup because it is a real cost on a provider that
+  bills egress.
+- `volvra.companion_report_immutable`, which the companion calls to
+  record the retention. Schema version 2 adds the columns it writes to
+  `volvra.companion_checkpoint`.
+
 ### Changed
 
 - The extension packaging no longer keeps a hand-written list of
@@ -23,6 +65,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing at exactly the point where upgrade coverage matters.
 
 ### Fixed
+
+- The companion test suites waited for the archive manifest before
+  writing test data, but the manifest exists before the replication
+  slot does, so a write issued in that window never reached the stream.
+  Both suites now wait for the slot. This was a test defect, not a
+  product one, but it made a suite report zero archived segments while
+  the trigger tier had captured every row.
 
 - `extension/test.sh` no longer fails intermittently on a slow
   container start. The script waited with `pg_isready`, which answers

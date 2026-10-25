@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,10 +25,15 @@ type Finding struct {
 func (f Finding) Fatal() bool { return f.Verdict != "UNRECORDED" }
 
 // VerifyArchive re-hashes every segment and re-walks the chain. It needs no
-// database and no network: an archive whose integrity depends on the system
-// that produced it is not a durable copy of anything.
-func VerifyArchive(dir string) ([]Finding, *Manifest, error) {
-	m, err := ReadManifest(dir)
+// database: an archive whose integrity depends on the system that produced it
+// is not a durable copy of anything.
+//
+// It reads through the Source, so the same check runs against a local
+// directory, against a bucket, or against both. Verifying the bucket's copy is
+// the point when the host is gone, and it is also the only way to notice that
+// an upload stored something different from what was sealed.
+func VerifyArchive(ctx context.Context, src Source) ([]Finding, *Manifest, error) {
+	m, err := ReadManifestFrom(ctx, src)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -37,8 +43,7 @@ func VerifyArchive(dir string) ([]Finding, *Manifest, error) {
 	prevEnd := ""
 
 	for _, seg := range m.Segments {
-		path := filepath.Join(dir, seg.File)
-		f, err := os.Open(path)
+		f, err := src.Open(ctx, seg.File)
 		if err != nil {
 			out = append(out, Finding{seg.Seq, "MISSING", err.Error()})
 			prevChain = seg.Chain
@@ -91,7 +96,7 @@ func VerifyArchive(dir string) ([]Finding, *Manifest, error) {
 
 		// A break in LSN continuity between segments is only alarming if no gap
 		// was recorded for it -- the companion writes one when it skips.
-		if prevEnd != "" && seg.StartLSN != "" && !gapRecorded(dir, m, seg.Seq) &&
+		if prevEnd != "" && seg.StartLSN != "" && !gapRecorded(ctx, src, m, seg.Seq) &&
 			seg.StartLSN < prevEnd {
 			out = append(out, Finding{seg.Seq, "OUT OF ORDER",
 				fmt.Sprintf("starts at %s, previous ended at %s", seg.StartLSN, prevEnd)})
@@ -101,7 +106,7 @@ func VerifyArchive(dir string) ([]Finding, *Manifest, error) {
 		prevEnd = seg.EndLSN
 	}
 
-	out = append(out, unrecorded(dir, m)...)
+	out = append(out, unrecorded(src.Dir, m)...)
 	return out, m, nil
 }
 
@@ -109,6 +114,12 @@ func VerifyArchive(dir string) ([]Finding, *Manifest, error) {
 // SIGKILL leaves one, because a segment reaches the manifest only when it is
 // closed; so does anyone dropping a file into the directory by hand.
 func unrecorded(dir string, m *Manifest) []Finding {
+	// Local disk only. A bucket contains exactly what was uploaded against a
+	// manifest entry, so there is no equivalent of a half-written file left by
+	// a SIGKILL, and nothing to report.
+	if dir == "" {
+		return nil
+	}
 	known := make(map[string]bool, len(m.Segments))
 	for _, s := range m.Segments {
 		known[s.File] = true
@@ -140,12 +151,12 @@ func unrecorded(dir string, m *Manifest) []Finding {
 	return out
 }
 
-func gapRecorded(dir string, m *Manifest, seq int) bool {
+func gapRecorded(ctx context.Context, src Source, m *Manifest, seq int) bool {
 	for _, s := range m.Segments {
 		if s.Seq != seq && s.Seq != seq-1 {
 			continue
 		}
-		f, err := os.Open(filepath.Join(dir, s.File))
+		f, err := src.Open(ctx, s.File)
 		if err != nil {
 			continue
 		}

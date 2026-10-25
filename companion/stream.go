@@ -176,6 +176,23 @@ func (s *Streamer) Run(ctx context.Context, start pglogrepl.LSN, report func(pgl
 			if err := s.arch.Rotate(); err != nil {
 				return fmt.Errorf("rotate: %w", err)
 			}
+
+			// Retry anything the bucket has not taken yet. Rotate uploads a
+			// segment as it closes, but a bucket that was unreachable then and
+			// is reachable now would otherwise never be retried until the next
+			// rotation -- which, on a quiet database, may be a long time, with
+			// the slot held back the whole while.
+			//
+			// A failure here is logged, not returned. The local archive is
+			// durable; what the failure costs is that ResumeLSN does not move,
+			// so the slot keeps the WAL and the lag guard below decides when
+			// that has gone on too long. Stopping the companion instead would
+			// turn a bucket outage into an outage of the whole durable tier.
+			if err := s.arch.PushRemote(ctx); err != nil {
+				log.Printf("note: %d segment(s) still to upload: %v",
+					s.arch.PendingUploads(), err)
+			}
+
 			durable := acked
 			if l := s.arch.ResumeLSN(); l != "" {
 				if p, err := pglogrepl.ParseLSN(l); err == nil && p > durable {

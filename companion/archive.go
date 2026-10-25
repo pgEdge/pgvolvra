@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -52,7 +53,19 @@ type Segment struct {
 	Prev     string `json:"prev,omitempty"` // previous segment's chain
 	Chain    string `json:"chain"`          // sha256(prev || sha256)
 	SealedAt string `json:"sealed_at"`
+
+	// Upload state. These are additive and optional on purpose: archiveFormat
+	// stays at 1, because OpenArchive refuses any manifest whose format is not
+	// exactly what this build writes, so bumping it would strand every archive
+	// written by an earlier release. A reader that does not know these fields
+	// ignores them and still reads the archive correctly.
+	UploadedAt string `json:"uploaded_at,omitempty"`
+	RemoteKey  string `json:"remote_key,omitempty"`
+	RemoteETag string `json:"remote_etag,omitempty"`
 }
+
+// Uploaded reports whether this segment is known to be in object storage.
+func (s Segment) Uploaded() bool { return s.UploadedAt != "" }
 
 type Manifest struct {
 	Archive     string    `json:"archive"`
@@ -74,7 +87,18 @@ type Archive struct {
 	curBytes int64
 	hasher   hash.Hash
 	maxBytes int64
+
+	lastPushErr error
+
+	// remote is nil unless object storage was configured, and every method
+	// below is a no-op in that case. The local archive is unchanged either
+	// way: the bucket is a destination, never a dependency of the write path.
+	remote *Remote
 }
+
+// UseRemote attaches object storage. Once attached, a segment is not
+// considered durable until it is in the bucket -- see ResumeLSN.
+func (a *Archive) UseRemote(r *Remote) { a.remote = r }
 
 func OpenArchive(dir, slot, publication string, maxBytes int64) (*Archive, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -116,11 +140,44 @@ func OpenArchive(dir, slot, publication string, maxBytes int64) (*Archive, error
 
 // ResumeLSN is the last LSN durably in the archive, and therefore the only
 // point it is safe to tell Postgres it may discard WAL up to.
+//
+// With object storage configured, "durable" means in the bucket. Advancing the
+// slot past a segment that exists only on local disk would mean that losing
+// the host loses both the segment and the WAL that could have replaced it --
+// which is the exact failure this feature exists to prevent. So an upload that
+// has not happened yet holds the slot, and WAL accumulates until it does. The
+// --lag-max valve remains the escape hatch when a bucket is unreachable for
+// long enough that retaining WAL becomes the bigger risk.
 func (a *Archive) ResumeLSN() string {
-	if n := len(a.man.Segments); n > 0 {
-		return a.man.Segments[n-1].EndLSN
+	segs := a.man.Segments
+	if a.remote != nil {
+		last := ""
+		for _, s := range segs {
+			if !s.Uploaded() {
+				break
+			}
+			last = s.EndLSN
+		}
+		return last
+	}
+	if n := len(segs); n > 0 {
+		return segs[n-1].EndLSN
 	}
 	return ""
+}
+
+// PendingUploads counts segments recorded locally but not yet in the bucket.
+func (a *Archive) PendingUploads() int {
+	if a.remote == nil {
+		return 0
+	}
+	n := 0
+	for _, s := range a.man.Segments {
+		if !s.Uploaded() {
+			n++
+		}
+	}
+	return n
 }
 
 func (a *Archive) writeManifest() error {
@@ -221,7 +278,81 @@ func (a *Archive) Rotate() error {
 		Chain:    hex.EncodeToString(chain[:]),
 		SealedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	})
-	return a.writeManifest()
+	if err := a.writeManifest(); err != nil {
+		return err
+	}
+
+	// Upload immediately, but do not let a bucket problem fail the rotation.
+	// The segment is already fsynced and recorded locally; the only thing an
+	// upload failure costs is that the slot will not advance past it, which is
+	// exactly the intended behaviour and is reported by the caller.
+	if a.remote != nil {
+		if err := a.PushRemote(context.Background()); err != nil {
+			a.lastPushErr = err
+		} else {
+			a.lastPushErr = nil
+		}
+	}
+	return nil
+}
+
+// LastPushError is the most recent upload failure, for the caller to log. It
+// is deliberately not returned from Rotate: archiving locally succeeded.
+func (a *Archive) LastPushError() error { return a.lastPushErr }
+
+// PushRemote uploads every segment the manifest records but the bucket does
+// not yet hold, then uploads the manifest.
+//
+// Order is the whole correctness argument. Segments go first, each verified
+// against the hash the manifest already chained; the manifest goes last, so it
+// can never name an object that is not in the bucket. An archive read from the
+// bucket alone is therefore always internally consistent, which is the state
+// it will be read in if the host is gone.
+//
+// Re-running this is safe and is how a crash mid-upload recovers: a segment
+// whose upload did not complete simply has no uploaded_at, so it is uploaded
+// again. Object storage PUT is idempotent for our purposes, since the bytes
+// are identical and the hash is checked either way.
+//
+// An error here is not fatal to archiving. The local archive is already
+// durable, and refusing to continue would turn a bucket outage into a stopped
+// companion. What a failure does do is hold ResumeLSN back, so the slot does
+// not advance past anything the bucket has not confirmed.
+func (a *Archive) PushRemote(ctx context.Context) error {
+	if a.remote == nil {
+		return nil
+	}
+	changed := false
+	for i := range a.man.Segments {
+		seg := &a.man.Segments[i]
+		if seg.Uploaded() {
+			continue
+		}
+		local := filepath.Join(a.dir, seg.File)
+		etag, err := a.remote.PutSegment(ctx, local, seg.File, seg.SHA256)
+		if err != nil {
+			// Stop at the first failure rather than skipping ahead: segments
+			// are a chain, and uploading a later one while an earlier one is
+			// missing would make the bucket's copy unreadable from the gap
+			// onwards for no benefit.
+			if changed {
+				_ = a.writeManifest()
+			}
+			return err
+		}
+		seg.UploadedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		seg.RemoteKey = seg.File
+		seg.RemoteETag = etag
+		changed = true
+	}
+	if changed {
+		if err := a.writeManifest(); err != nil {
+			return err
+		}
+	}
+	// The manifest is uploaded even when no segment changed, because the local
+	// copy may carry upload state the bucket's copy predates.
+	return a.remote.PutManifest(ctx, filepath.Join(a.dir, "manifest.json"))
 }
 
 func (a *Archive) Stats() (segments int, changes int64) {
