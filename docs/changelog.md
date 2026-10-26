@@ -4,7 +4,7 @@ All notable changes to pgVolvra are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/), and pgVolvra
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0-beta3] - 2026-10-25
+## [1.0.0-beta3] - 2026-10-26
 
 ### Added
 
@@ -36,9 +36,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   force, `volvra.preflight` reports the condition, and
   `volvra.companion_status` shows the mode and duration.
 - Google Cloud Storage support through its S3 interoperability
-  endpoint, which needs no separate client. GCS does not implement the
-  aws-chunked trailing header that carries a server-side checksum, and
-  an upload asking for one there fails rather than degrading, so
+  endpoint, which needs no separate client, verified against a real
+  bucket. GCS does not implement the aws-chunked trailing header that
+  carries a server-side checksum, and an upload asking for one against
+  a Google endpoint fails rather than degrading, so
   `--s3-checksum` defaults to `auto` and selects read-back verification
   for `storage.googleapis.com`. Read-back downloads each segment after
   uploading it to hash it locally, which doubles the traffic and is
@@ -50,6 +51,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `--segment-bytes` now defaults to 12 MB rather than 64 MB. An upload
+  larger than about 16 MB is split into parts, and the composite
+  checksum S3 returns for a multipart upload cannot be compared with
+  the manifest hash, so the companion had to download every segment
+  again to verify it. Staying under that threshold roughly halves the
+  traffic archiving costs. Raise it for archives past roughly 700 GB,
+  where more segments mean more manifest uploads.
 - The extension packaging no longer keeps a hand-written list of
   released versions. `extension/build.sh` now derives the versions
   that need an `ALTER EXTENSION UPDATE` path from the release
@@ -66,6 +74,21 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Archiving to a bucket with S3 Object Lock enabled failed outright. S3
+  refuses any upload that carries no checksum header on such a bucket,
+  and the manifest upload sent none, so the companion stopped at
+  startup with "Content-MD5 OR x-amz-checksum- HTTP header is required
+  for Put Object requests with Object Lock parameters". A checksum is
+  now always sent. No S3 implementation available as a container image
+  enforces this requirement, so the fault was only visible against a
+  real bucket.
+- A segment larger than about 16 MB is uploaded in parts, and the
+  composite checksum S3 returns for a multipart upload cannot be
+  compared with the manifest hash. The companion fell back to reading
+  the object back and hashing it, which is correct but was silent.
+  Since segments default to 64 MB, that fallback is the normal path on
+  Amazon S3 and it costs an extra download per segment, so it is now
+  reported once per run.
 - The companion test suites waited for the archive manifest before
   writing test data, but the manifest exists before the replication
   slot does, so a write issued in that window never reached the stream.

@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -83,9 +85,10 @@ type RemoteOptions struct {
 //
 // The distinction is not academic. Server-side checksums travel as a trailing
 // header with aws-chunked framing (STREAMING-UNSIGNED-PAYLOAD-TRAILER), which
-// is an AWS extension. Google Cloud Storage's S3 interoperability endpoint
-// does not implement it, so asking for one there does not degrade -- the
-// upload fails.
+// is an AWS extension that Google Cloud Storage does not implement. The S3
+// client refuses outright rather than degrading: asking for a checksum against
+// a Google endpoint fails the upload with "Checksum cannot be used with GCS
+// endpoints". Confirmed against a real GCS bucket on 2026-10-26.
 const (
 	checksumServer   = "server"
 	checksumReadback = "readback"
@@ -125,6 +128,9 @@ type Remote struct {
 	prefix   string
 	lock     LockState
 	checksum string
+
+	// Said once per run, not once per segment.
+	sayReadback sync.Once
 }
 
 // NewRemote connects and establishes what the bucket will do to our objects.
@@ -262,6 +268,14 @@ func (r *Remote) PutSegment(ctx context.Context, localPath, name, wantSHA string
 		// is an MD5 only for single-part uploads and is not a hash of the
 		// content after a multipart one.
 		opts.Checksum = minio.ChecksumSHA256
+	} else {
+		// A bucket with Object Lock enabled REFUSES any PUT that carries no
+		// checksum header: "Content-MD5 OR x-amz-checksum- HTTP header is
+		// required for Put Object requests with Object Lock parameters". So
+		// when no SHA-256 is being requested, send Content-MD5 instead. It is
+		// a transport check only; the manifest's SHA-256 chain remains what
+		// proves the archive.
+		opts.SendContentMd5 = true
 	}
 	info, err := r.cli.PutObject(ctx, r.bucket, r.key(name), f, st.Size(), opts)
 	if err != nil {
@@ -277,11 +291,23 @@ func (r *Remote) PutSegment(ctx context.Context, localPath, name, wantSHA string
 // confirm compares what the provider stored against what the manifest claims.
 //
 // The provider's checksum is preferred because it is computed server side from
-// the bytes it persisted. When it is absent -- some S3 implementations do not
-// return one -- the object is read back and hashed, which is slower but still
-// proves the round trip rather than assuming it.
+// the bytes it persisted. Two cases make it unusable, and both end in reading
+// the object back and hashing it here:
+//
+//   - Some S3 implementations return no checksum at all.
+//   - A MULTIPART upload returns a COMPOSITE checksum: a hash of the part
+//     hashes with the part count appended, like "n1u...=-3". It is not a hash
+//     of the content and cannot be compared with the manifest's SHA-256. S3
+//     has no full-object SHA-256 for multipart uploads, so there is nothing
+//     better to ask for.
+//
+// This matters more than it looks. Segments default to 64 MB, which is always
+// a multipart upload, so on Amazon S3 the read-back path is the normal one
+// rather than the exception. It verifies just as strictly and costs an extra
+// download per segment, which is billed, so it is said out loud once per run
+// instead of being discovered on an invoice.
 func (r *Remote) confirm(ctx context.Context, name, wantSHA, gotB64 string) error {
-	if gotB64 != "" {
+	if gotB64 != "" && !strings.Contains(gotB64, "-") {
 		raw, err := base64.StdEncoding.DecodeString(gotB64)
 		if err == nil {
 			if got := hex.EncodeToString(raw); got != wantSHA {
@@ -291,6 +317,17 @@ func (r *Remote) confirm(ctx context.Context, name, wantSHA, gotB64 string) erro
 			return nil
 		}
 	}
+	r.sayReadback.Do(func() {
+		if gotB64 == "" {
+			log.Printf("NOTICE: this provider returns no upload checksum, so each "+
+				"segment is read back and hashed to verify it (%s)", r.URI())
+		} else {
+			log.Printf("NOTICE: segments are large enough to upload in parts, and a "+
+				"multipart checksum cannot be compared with the manifest hash, so "+
+				"each segment is read back and hashed to verify it. This doubles "+
+				"the traffic per segment (%s)", r.URI())
+		}
+	})
 
 	obj, err := r.cli.GetObject(ctx, r.bucket, r.key(name), minio.GetObjectOptions{})
 	if err != nil {
@@ -321,7 +358,13 @@ func (r *Remote) PutManifest(ctx context.Context, localPath string) error {
 	if err != nil {
 		return err
 	}
-	opts := minio.PutObjectOptions{ContentType: "application/json"}
+	// Always checksummed, for the Object Lock reason above: a lock-enabled
+	// bucket rejects an unchecksummed PUT, and without this the manifest
+	// upload fails and archiving to such a bucket cannot work at all.
+	opts := minio.PutObjectOptions{
+		ContentType:    "application/json",
+		SendContentMd5: true,
+	}
 	_, err = r.cli.PutObject(ctx, r.bucket, r.key("manifest.json"), f, st.Size(), opts)
 	if err != nil {
 		return fmt.Errorf("upload manifest: %w", err)

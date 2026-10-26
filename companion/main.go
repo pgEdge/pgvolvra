@@ -70,7 +70,13 @@ func main() {
 	archive := fs.String("archive", "", "archive directory")
 	slot := fs.String("slot", "volvra_companion", "logical replication slot")
 	pub := fs.String("publication", "volvra_pub", "publication to stream")
-	segBytes := fs.Int64("segment-bytes", 64<<20, "rotate a segment at this size")
+	// 12 MB, deliberately under the ~16 MB point where an upload is split
+	// into parts. S3 answers a multipart upload with a composite checksum
+	// that cannot be compared with the manifest hash, which forces the
+	// companion to download every segment again to verify it. Staying under
+	// the threshold keeps verification to a single server-side checksum and
+	// roughly halves the traffic archiving costs.
+	segBytes := fs.Int64("segment-bytes", 12<<20, "rotate a segment at this size")
 	lagWarn := fs.Int64("lag-warn", 512<<20, "warn when the slot retains this much WAL")
 	lagMax := fs.Int64("lag-max", 5<<30, "advance the slot past this, recording a gap")
 	dry := fs.Bool("dry-run", false, "restore: parse and count, change nothing")
@@ -195,7 +201,15 @@ func cmdRun(ctx context.Context, dsn, dir, slot, pub string,
 				n, src.Remote.URI())
 		}
 		if err := arch.PushRemote(ctx); err != nil {
-			return fmt.Errorf("could not reach the bucket at startup: %w", err)
+			// Not fatal, and deliberately so. Everywhere else a bucket that is
+			// briefly unreachable is retried and recovered from; startup used
+			// to be the one place that gave up, which turned a slow object
+			// store into a companion that never ran. Nothing unsafe follows:
+			// ResumeLSN holds the slot at what the bucket's manifest actually
+			// covers, so a backlog costs retained write-ahead log and never
+			// costs history. The status loop retries every few seconds.
+			log.Printf("WARNING: could not reach the bucket at startup, will "+
+				"keep retrying: %v", err)
 		}
 	}
 

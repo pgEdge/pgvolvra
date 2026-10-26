@@ -68,7 +68,7 @@ The following table describes each flag the command accepts:
 |---|---|---|
 | --slot | volvra_companion | The logical replication slot to read. |
 | --publication | volvra_pub | The publication to stream. |
-| --segment-bytes | 67108864, which is 64 MB | Rotate to a new segment once the current one reaches this size. |
+| --segment-bytes | 12582912, which is 12 MB | Rotate to a new segment once the current one reaches this size. The default sits below the point where an upload is split into parts, so object storage can verify it with a server-side checksum instead of the companion downloading it again. |
 | --lag-warn | 536870912, which is 512 MB | Log a warning once the slot retains this much write-ahead log. |
 | --lag-max | 5368709120, which is 5 GB | Advance the slot past this volume and record the skipped range as a gap. |
 | --s3-bucket | None | Upload rotated segments to this bucket. Object storage is off when unset. |
@@ -91,8 +91,9 @@ With a bucket configured, the replication slot does not advance past a
 segment the bucket has not confirmed, so a bucket outage retains
 write-ahead log rather than releasing it.
 
-Google Cloud Storage rejects the aws-chunked trailing header that
-carries a server-side checksum, so `--s3-checksum` defaults to `auto`
+Google Cloud Storage does not implement the aws-chunked trailing header
+that carries a server-side checksum, and asking for one against a
+Google endpoint fails the upload, so `--s3-checksum` defaults to `auto`
 and selects read-back verification for `storage.googleapis.com`.
 Read-back downloads each segment after uploading it, which doubles the
 traffic; the companion says so at startup.

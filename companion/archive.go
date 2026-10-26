@@ -90,6 +90,19 @@ type Archive struct {
 
 	lastPushErr error
 
+	// Manifest uploads are rate limited. The manifest holds one entry per
+	// segment and is complete every time it is written, so uploading it after
+	// every rotation makes archive traffic grow with the SQUARE of the segment
+	// count: the Nth rotation would upload N entries. At 12 MB segments that
+	// overtakes the segment data itself well before a terabyte of history.
+	//
+	// Uploading on a time bound instead makes the cost depend on how long the
+	// companion runs rather than on how many segments it wrote.
+	lastManifestAt time.Time
+	// The highest segment sequence the manifest IN THE BUCKET covers. The slot
+	// must not advance past it; see ResumeLSN.
+	manifestSeq int
+
 	// remote is nil unless object storage was configured, and every method
 	// below is a no-op in that case. The local archive is unchanged either
 	// way: the bucket is a destination, never a dependency of the write path.
@@ -99,6 +112,11 @@ type Archive struct {
 // UseRemote attaches object storage. Once attached, a segment is not
 // considered durable until it is in the bucket -- see ResumeLSN.
 func (a *Archive) UseRemote(r *Remote) { a.remote = r }
+
+// How often the manifest may be uploaded. The cost of waiting is that the
+// replication slot lags by at most this long, so Postgres keeps a little more
+// write-ahead log; the cost of not waiting is quadratic upload traffic.
+const manifestInterval = 30 * time.Second
 
 func OpenArchive(dir, slot, publication string, maxBytes int64) (*Archive, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -153,7 +171,12 @@ func (a *Archive) ResumeLSN() string {
 	if a.remote != nil {
 		last := ""
 		for _, s := range segs {
-			if !s.Uploaded() {
+			// Durable means two things: the segment is in the bucket, AND the
+			// manifest in the bucket names it. A segment uploaded but not yet
+			// referenced by the uploaded manifest is unreachable to anyone
+			// reading the bucket, so acknowledging it would release WAL for
+			// history that cannot be found again.
+			if !s.Uploaded() || s.Seq > a.manifestSeq {
 				break
 			}
 			last = s.EndLSN
@@ -319,6 +342,16 @@ func (a *Archive) LastPushError() error { return a.lastPushErr }
 // companion. What a failure does do is hold ResumeLSN back, so the slot does
 // not advance past anything the bucket has not confirmed.
 func (a *Archive) PushRemote(ctx context.Context) error {
+	return a.pushRemote(ctx, false)
+}
+
+// FlushRemote pushes everything and the manifest with it, ignoring the rate
+// limit. Used at shutdown, where there is no later call to catch up.
+func (a *Archive) FlushRemote(ctx context.Context) error {
+	return a.pushRemote(ctx, true)
+}
+
+func (a *Archive) pushRemote(ctx context.Context, force bool) error {
 	if a.remote == nil {
 		return nil
 	}
@@ -350,9 +383,29 @@ func (a *Archive) PushRemote(ctx context.Context) error {
 			return err
 		}
 	}
-	// The manifest is uploaded even when no segment changed, because the local
-	// copy may carry upload state the bucket's copy predates.
-	return a.remote.PutManifest(ctx, filepath.Join(a.dir, "manifest.json"))
+
+	// The highest sequence the manifest WOULD cover if uploaded now.
+	ready := 0
+	for _, seg := range a.man.Segments {
+		if !seg.Uploaded() {
+			break
+		}
+		ready = seg.Seq
+	}
+	if ready == a.manifestSeq {
+		return nil // the bucket's manifest is already current
+	}
+	if !force && time.Since(a.lastManifestAt) < manifestInterval {
+		// Deliberately behind. ResumeLSN holds the slot at manifestSeq, so
+		// the delay costs retained WAL and never costs correctness.
+		return nil
+	}
+	if err := a.remote.PutManifest(ctx, filepath.Join(a.dir, "manifest.json")); err != nil {
+		return err
+	}
+	a.manifestSeq = ready
+	a.lastManifestAt = time.Now()
+	return nil
 }
 
 func (a *Archive) Stats() (segments int, changes int64) {
@@ -362,7 +415,16 @@ func (a *Archive) Stats() (segments int, changes int64) {
 	return len(a.man.Segments), changes
 }
 
-func (a *Archive) Close() error { return a.Rotate() }
+// Close rotates the open segment and then flushes everything to the bucket,
+// manifest included. This is the one place the manifest rate limit is ignored:
+// there is no later call to catch up, and a manifest left behind would strand
+// segments that are already uploaded.
+func (a *Archive) Close() error {
+	if err := a.Rotate(); err != nil {
+		return err
+	}
+	return a.FlushRemote(context.Background())
+}
 
 // ReadManifest is used by verify and restore, which must work with no database
 // and no running companion.

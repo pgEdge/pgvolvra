@@ -74,12 +74,13 @@ volvra-companion run \
 ```
 
 One difference matters, and the companion handles it automatically.
-A server-side checksum travels as an aws-chunked trailing header, which
-is an AWS extension that GCS does not implement; asking for one there
-does not degrade gracefully, it fails the upload. So `--s3-checksum`
-defaults to `auto`, which selects read-back verification for
-`storage.googleapis.com` and server checksums everywhere else. The
-companion says which it is using at startup.
+A server-side checksum travels as an aws-chunked trailing header, an
+AWS extension that Google Cloud Storage does not implement. Asking for
+one against a Google endpoint does not degrade gracefully; the upload
+fails with "Checksum cannot be used with GCS endpoints". So
+`--s3-checksum` defaults to `auto`, which selects read-back
+verification for `storage.googleapis.com` and server checksums
+everywhere else. The companion says which it is using at startup.
 
 Read-back verification downloads each segment after uploading it, so
 archiving moves roughly twice the data. On a provider that bills egress
@@ -90,14 +91,36 @@ silently chosen.
 
 A segment counts as archived when the provider confirms it, not when
 the upload is sent. After uploading, the companion compares the
-provider's SHA-256 against the hash the manifest already chained. In
-read-back mode, or when a provider returns no checksum, the object is
-downloaded and hashed instead. Either way a mismatch fails the upload
-rather than recording it.
+provider's SHA-256 against the hash the manifest already chained. If
+that comparison is not possible, the object is downloaded and hashed
+instead. Either way a mismatch fails the upload rather than recording
+it.
 
 The ETag is deliberately not used for this. It is an MD5 only for
 single-part uploads, and after a multipart upload it is not a hash of
 the content at all.
+
+### Large segments are verified by reading them back
+
+A segment larger than about 16 MB is uploaded in parts, and S3 answers a
+multipart upload with a composite checksum: a hash of the part hashes
+with the part count appended, such as `n1u...Mm7o=-3`. That is not a
+hash of the content and cannot be compared with the manifest's SHA-256.
+S3 offers no full-object SHA-256 for multipart uploads, so there is
+nothing better to request.
+
+Segments default to 12 MB for this reason, which keeps an upload to a
+single part so the server-side checksum can be used. Raising
+`--segment-bytes` past roughly 16 MB brings the read-back path back.
+Verification is exactly as strict either way; the difference is one
+extra download per segment, which is billed. The companion says so once
+per run rather than leaving it to be discovered on an invoice.
+
+Very large archives are the one case for raising it. The manifest is
+re-uploaded after every rotation and grows by one entry each time, so
+more segments mean more manifest traffic. Past roughly 700 GB of total
+history, larger segments cost less overall even with the extra
+downloads.
 
 The manifest is uploaded after the segments it names, so the copy in
 the bucket never references an object that is not there. An archive
@@ -189,11 +212,12 @@ The following table describes what has been verified:
 
 | Provider | Status |
 |---|---|
+| Amazon S3 | Verified on a real bucket: upload, multipart upload at the default 64 MB segment size, checksum verification by both paths, verify and restore from the bucket alone. |
+| Object lock on Amazon S3 | Verified on a real bucket: a bucket retention policy is detected, recorded and reported through volvra.forget and volvra.preflight, and S3 does refuse to delete an archived segment while the retention stands. pgVolvra never sets a retention. |
 | S3-compatible storage generally | Verified against SeaweedFS and adobe/s3mock, covering both the server-checksum and read-back verification paths. |
-| AWS S3, Cloudflare R2, Backblaze B2, Wasabi | Designed for, not yet run. |
-| Google Cloud Storage via S3 interoperability | Configuration documented and the read-back verification path it requires is tested. Not yet run against a real GCS bucket. |
-| Object lock detection | Tested: a bucket retention policy is detected, recorded and reported through volvra.forget and volvra.preflight. pgVolvra never sets a retention. |
-| Instance and workload identity roles | Designed for, not yet run. Local testing uses environment credentials. |
+| Cloudflare R2, Backblaze B2, Wasabi | Designed for, not yet run. |
+| Google Cloud Storage via S3 interoperability | Verified on a real bucket with an HMAC key: uploads, read-back verification, and verify and restore from the bucket alone. Confirmed that a server-side checksum is refused there, which is why auto selects read-back. |
+| Instance and workload identity roles | Designed for, not yet run. Testing uses credentials from the environment. |
 
 ## Next Steps
 

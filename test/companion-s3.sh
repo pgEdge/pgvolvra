@@ -79,6 +79,25 @@ cm() { env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" "$BIN" "$@"; }
 # Running env directly makes $! the process that becomes the companion.
 cmbg() { env AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" "$BIN" "$@"; }
 
+# Run the companion until its log matches a pattern, then stop it.
+#
+# An upload failure used to be fatal at startup, so these checks could just run
+# the companion in the foreground and wait for it to die. It now reports and
+# retries, which is the point of the change, so waiting for an exit hangs
+# forever. Wait for the message instead.
+run_until() {
+  local pattern="$1" logfile="$2" secs="$3" slot="$4"; shift 4
+  cmbg "$@" >"$logfile" 2>&1 &
+  local pid=$!
+  local i
+  for i in $(seq 1 $((secs * 2))); do
+    grep -qiE "$pattern" "$logfile" 2>/dev/null && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  stop_companion "$pid" "$slot"
+}
+
 # Stop a companion and wait until it has really gone, slot included.
 stop_companion() {
   local pid="$1" slot="${2:-volvra_companion}"
@@ -343,6 +362,47 @@ done
 
 fi
 
+# The slot must not pass what the manifest IN THE BUCKET covers, which is a
+# stricter rule than "not past the last uploaded segment". The manifest is
+# uploaded on a time bound rather than after every rotation, because a
+# complete manifest per rotation makes archive traffic grow with the square
+# of the segment count. A segment uploaded but not yet named by the uploaded
+# manifest is unreachable to anyone reading the bucket, so acknowledging it
+# would release write-ahead log for history that cannot be found again.
+BUCKET_LAST="$(python3 - "$S3PORT" "$BUCKET" "$AK" "$SK" <<'MANIFETCH'
+import sys, urllib.request, hashlib, hmac, datetime, json
+port, bucket, ak, sk = sys.argv[1:5]
+host = f"127.0.0.1:{port}"
+t = datetime.datetime.now(datetime.timezone.utc)
+amz = t.strftime('%Y%m%dT%H%M%SZ'); ds = t.strftime('%Y%m%d')
+ph = hashlib.sha256(b'').hexdigest()
+canon = (f"GET\n/{bucket}/manifest.json\n\nhost:{host}\nx-amz-content-sha256:{ph}\n"
+         f"x-amz-date:{amz}\n\nhost;x-amz-content-sha256;x-amz-date\n{ph}")
+scope = f"{ds}/us-east-1/s3/aws4_request"
+sts = f"AWS4-HMAC-SHA256\n{amz}\n{scope}\n{hashlib.sha256(canon.encode()).hexdigest()}"
+def g(k, m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
+k = g(g(g(g(('AWS4'+sk).encode(), ds), 'us-east-1'), 's3'), 'aws4_request')
+sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+auth = (f"AWS4-HMAC-SHA256 Credential={ak}/{scope}, "
+        f"SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={sig}")
+try:
+    body = urllib.request.urlopen(urllib.request.Request(
+        f"http://{host}/{bucket}/manifest.json",
+        headers={'Authorization': auth, 'x-amz-date': amz,
+                 'x-amz-content-sha256': ph}), timeout=15).read()
+    segs = json.loads(body).get('segments') or []
+    print(segs[-1]['end_lsn'] if segs else '0/0')
+except Exception:
+    print('0/0')
+MANIFETCH
+)"
+HELD2="$(q -c "SELECT confirmed_flush_lsn <= '${BUCKET_LAST}'::pg_lsn FROM pg_replication_slots WHERE slot_name='volvra_companion'")"
+if [[ "$HELD2" == "t" ]]; then
+  ok "slot is within the manifest the bucket actually holds (to $BUCKET_LAST)"
+else
+  bad "slot passed the bucket's manifest ($BUCKET_LAST): WAL released for segments nothing in the bucket references"
+fi
+
 printf '=== S8. stop cleanly, then verify the bucket copy ===\n'
 stop_companion "$COMPANION_PID"
 unset COMPANION_PID
@@ -420,10 +480,16 @@ s['sha256']='0'*64          # a hash the bytes cannot possibly produce
 json.dump(m, open(p,'w'), indent=2)
 print("       segment %d re-marked unuploaded with a wrong sha256" % s['seq'])
 PY
-cm run --dsn "$DSN" --archive "$ARCHIVE" "${S3FLAGS[@]}" >"$WORK/badhash.log" 2>&1
+run_until "manifest says|sha256" "$WORK/badhash.log" 45 volvra_companion \
+  run --dsn "$DSN" --archive "$ARCHIVE" "${S3FLAGS[@]}"
 grep -qi "manifest says\|sha256" "$WORK/badhash.log" \
   && ok "an upload whose bytes do not match the sealed hash is rejected" \
   || { bad "upload hash mismatch must be rejected"; sed 's/^/       /' "$WORK/badhash.log" | head -6; }
+# And it must carry on rather than dying, which is what lets a transient
+# bucket problem recover without anyone restarting the process.
+grep -qi "will keep retrying\|still to upload" "$WORK/badhash.log" \
+  && ok "and the companion keeps running instead of exiting" \
+  || bad "a rejected upload should be retried, not fatal"
 
 printf '=== S13. credentials never appear in logs or in the database ===\n'
 if grep -q "$SK" "$WORK"/*.log 2>/dev/null; then
@@ -455,6 +521,7 @@ printf '=== S14. a bucket that enforces object lock is reported ===\n'
 # the feature now claims.
 qq -c "TRUNCATE volvra.companion_checkpoint" >/dev/null 2>&1
 
+LOCK_UNTESTED=0
 LOCKBUCKET="volvra-locked"
 python3 - "$S3PORT" "$LOCKBUCKET" "$AK" "$SK" <<'MKLOCK'
 import sys, urllib.request, hashlib, hmac, datetime
@@ -509,10 +576,29 @@ cmbg run --dsn "$DSN" --archive "$WORK/lockarch" \
 LOCKPID=$!
 for _ in $(seq 1 60); do
   [[ "$(q -c "SELECT count(*) FROM volvra.companion_checkpoint WHERE immutable_mode IS NOT NULL")" == "1" ]] && break
+  kill -0 "$LOCKPID" 2>/dev/null || break      # it died; stop waiting on it
   sleep 0.5
 done
+
+# Separate "the companion could not start" from "the companion did not
+# report". They fail the same assertions and have nothing else in common.
+# A loaded machine can make the store slow enough that the startup upload
+# fails, and that failure is fatal by design, so the run ends before
+# anything is recorded.
+if ! kill -0 "$LOCKPID" 2>/dev/null; then
+  if grep -qi "could not reach the bucket at startup" "$WORK/lock.log"; then
+    echo "  SKIP the companion could not reach the store at startup, so the"
+    echo "       object lock reporting below was never exercised. This is the"
+    echo "       test store being slow, not a product failure:"
+    sed -n 's/^/       /p' "$WORK/lock.log" | tail -2
+    LOCK_UNTESTED=1
+  fi
+fi
 stop_companion "$LOCKPID"
 
+if [[ $LOCK_UNTESTED -eq 1 ]]; then
+  bad "object lock reporting was not exercised: the test store did not come up"
+else
 grep -q "this bucket enforces object lock" "$WORK/lock.log" \
   && ok "the companion notices a retention it did not ask for" \
   || { bad "should detect the bucket's retention"; sed 's/^/       /' "$WORK/lock.log" | head -6; }
@@ -552,6 +638,7 @@ grep -q "including the account root" "$WORK/forget.log" \
 PF="$(q -c "SELECT severity||': '||finding FROM volvra.preflight() WHERE finding LIKE '%object lock%'")"
 [[ "$PF" == warning:* ]] && ok "preflight reports it: $PF" \
                          || bad "preflight should report the object lock (got '$PF')"
+fi
 
 printf '=== S15. no object lock means no noise ===\n'
 qq -c "UPDATE volvra.companion_checkpoint SET immutable_mode=NULL, immutable_days=NULL, immutable_source=NULL" >/dev/null 2>&1
@@ -630,9 +717,9 @@ s['uploaded_at']=''; s.pop('remote_key',None); s.pop('remote_etag',None)
 s['sha256']='0'*64
 json.dump(m, open(p,'w'), indent=2)
 BADHASH
-cm run --dsn "$DSN" --archive "$WORK/rbarch" "${S3FLAGS[@]}" \
-  --slot volvra_readback --s3-prefix readback --s3-checksum readback \
-  >"$WORK/rbbad.log" 2>&1
+run_until "manifest says|sha256" "$WORK/rbbad.log" 45 volvra_readback \
+  run --dsn "$DSN" --archive "$WORK/rbarch" "${S3FLAGS[@]}" \
+  --slot volvra_readback --s3-prefix readback --s3-checksum readback
 grep -qi "manifest says\|sha256" "$WORK/rbbad.log" \
   && ok "readback rejects an upload whose bytes do not match the sealed hash" \
   || { bad "readback must reject a hash mismatch"; echo "       --- rbbad.log (full) ---"; sed 's/^/       /' "$WORK/rbbad.log"; echo "       --- manifest ---"; sed 's/^/       /' "$WORK/rbarch/manifest.json" | head -25; }
