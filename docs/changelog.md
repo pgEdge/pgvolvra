@@ -15,8 +15,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Local disk remains the write path, so every existing durability
   guarantee is unchanged, and uploaded segments are kept locally so
   verification still works with no network. One client covers AWS S3,
-  Cloudflare R2, Backblaze B2, Wasabi, MinIO and Google Cloud Storage
-  through its S3 interoperability endpoint.
+  Amazon S3, and Google Cloud Storage through its S3 interoperability
+  endpoint. Both are verified against real buckets. Other S3-compatible
+  stores use the same protocol and are expected to work, but have not
+  been run and are not claimed.
 - The replication slot now waits for the bucket. With object storage
   configured, the slot does not advance past a segment the bucket has
   not confirmed, because releasing write-ahead log for data held only

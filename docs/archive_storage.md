@@ -204,9 +204,10 @@ bucket. pgVolvra will detect it and report it.
 
 ## Supported providers
 
-The companion speaks the S3 API only, which covers AWS S3, Cloudflare
-R2, Backblaze B2, Wasabi, MinIO and other S3-compatible stores. Google
-Cloud Storage is reachable through its S3 interoperability endpoint.
+The companion speaks the S3 API only. Amazon S3 and Google Cloud Storage
+are verified against real buckets. Other S3-compatible stores, such as
+Cloudflare R2, Backblaze B2, Wasabi and MinIO, use the same protocol and
+are expected to work, but none has been run, so none is claimed.
 
 The following table describes what has been verified:
 
@@ -215,7 +216,7 @@ The following table describes what has been verified:
 | Amazon S3 | Verified on a real bucket: upload, multipart upload at the default 64 MB segment size, checksum verification by both paths, verify and restore from the bucket alone. |
 | Object lock on Amazon S3 | Verified on a real bucket: a bucket retention policy is detected, recorded and reported through volvra.forget and volvra.preflight, and S3 does refuse to delete an archived segment while the retention stands. pgVolvra never sets a retention. |
 | S3-compatible storage generally | Verified against SeaweedFS and adobe/s3mock, covering both the server-checksum and read-back verification paths. |
-| Cloudflare R2, Backblaze B2, Wasabi | Designed for, not yet run. |
+| Cloudflare R2, Backblaze B2, Wasabi, MinIO | Same protocol, expected to work, not yet run. Not claimed as supported. |
 | Google Cloud Storage via S3 interoperability | Verified on a real bucket with an HMAC key: uploads, read-back verification, and verify and restore from the bucket alone. Confirmed that a server-side checksum is refused there, which is why auto selects read-back. |
 | Instance and workload identity roles | Designed for, not yet run. Testing uses credentials from the environment. |
 

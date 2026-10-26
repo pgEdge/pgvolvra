@@ -29,9 +29,11 @@ import (
 // manifest swears a segment exists, and a slot already advanced past it, is
 // the worst failure a durability tier can have.
 //
-// Only the S3 API is spoken. One client covers AWS S3, Cloudflare R2, MinIO,
-// Backblaze B2 and Wasabi, and minio-go is pure Go, so CGO_ENABLED=0 static
-// builds and the eleven-distribution portability story survive untouched.
+// Only the S3 API is spoken, so one client reaches any S3-compatible store.
+// Amazon S3 and Google Cloud Storage are the two verified against real
+// buckets; the rest are expected to work and are deliberately not claimed.
+// minio-go is pure Go, so CGO_ENABLED=0 static builds and the
+// eleven-distribution portability story survive untouched.
 
 // LockState describes whether objects written to this bucket become immutable.
 //
