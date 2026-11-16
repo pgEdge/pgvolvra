@@ -1,6 +1,6 @@
 module github.com/pgedge/pgvolvra/cli
 
-go 1.25.0
+go 1.26.10
 
 require (
 	github.com/jackc/pgx/v5 v5.9.1

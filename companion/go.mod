@@ -1,10 +1,11 @@
 module github.com/pgedge/pgvolvra/companion
 
-go 1.25.0
+go 1.26.10
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20260824121319-4ae5c490f7ce
 	github.com/jackc/pgx/v5 v5.9.1
+	github.com/minio/minio-go/v7 v7.3.0
 )
 
 require (
@@ -19,7 +20,6 @@ require (
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
-	github.com/minio/minio-go/v7 v7.3.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect

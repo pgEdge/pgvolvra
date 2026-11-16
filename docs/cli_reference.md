@@ -51,7 +51,7 @@ table above, against a real database reached by hostname.
 ## Building the tool
 
 The tool is a single Go binary in `cli/`, with no runtime
-dependencies. Build the tool with Go 1.25 or later:
+dependencies. Build the tool with Go 1.26.10 or later:
 
 ```bash
 make -C cli
